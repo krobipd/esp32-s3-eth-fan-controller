@@ -17,7 +17,7 @@ läuft später über das dann abgesicherte OTA.
 |---|---|
 | Vorgehen | **Zweistufig:** erst härten (diese Spec), dann Architektur-Umbau (Stufe 2) |
 | UI-Umfang | Heutige Funktionen modernisiert **+ System-Monitor** (keine Graphen, keine Automatik/Kurven) |
-| MQTT-Topics | **Sofort neues v3.3-Schema** `<prefix>/<deviceId>/fan/<name>/pct|rpm|set` (0..100); ioBroker wird nach dem Flash nachgezogen |
+| MQTT-Topics | **Sofort neues, flaches Schema** `<prefix>/<deviceId>/<name>/speed|set|rpm` (0..100, Details §4); ioBroker wird nach dem Flash nachgezogen |
 | Design-Richtung | **A: Control-Room / Industrial** (Monospace-Zahlen, Status-LEDs, dichte Raster, dunkel) |
 | Navigation | **B: Tab-Leiste** — Dashboard / System / Einstellungen / Firmware |
 | UI-Technik | **Statische App + JSON-API:** eine HTML/CSS/JS-Datei, gzip im Flash, Daten nur über `/api/*`, Polling (kein SSE) |
@@ -89,10 +89,15 @@ Verlassen durch erfolgreichen OTA-Flash oder manuellen Reset des Streaks im UI.
 - Beibehaltene Bewährtes: Queues (`g_apply`, `g_pendingDuty`), PCNT/ISR-Zweistufigkeit,
   Storm-Shield, Median+EMA, W5500-Auto-Reset, debounced State-Writes — unverändert.
 
-## 4. MQTT (neues Schema, sofort)
+## 4. MQTT (neues Schema, sofort — Nutzer-Revision 11.06.: flach + sprechende Namen)
 
-- Topics: `<prefix>/<deviceId>/status` (retained online/offline, LWT) ·
-  `…/fan/<name>/pct` (0..100, retained) · `…/fan/<name>/rpm` · Befehl `…/fan/<name>/set` (0..100).
+- Topics (KEINE `fan/`-Zwischenebene, pro Lüfter genau drei Datenpunkte):
+  - `<prefix>/<deviceId>/status` — `online`/`offline` (retained, LWT)
+  - `<prefix>/<deviceId>/<name>/speed` — Ist-Stellwert **0..100 %** (retained)
+  - `<prefix>/<deviceId>/<name>/set` — Befehl 0..100 (kein Retain; einziger Schreib-Datenpunkt)
+  - `<prefix>/<deviceId>/<name>/rpm` — Drehzahl
+- Reservierte Lüfternamen: `status`, `sys` (Kollision mit Geräte-Datenpunkten) —
+  Validierung lehnt sie ab.
 - Stack bleibt PubSubClient + Ethernet.h (Stufe 1), Backoff-Reconnect (wrap-sicher),
   `setSocketTimeout(3)`.
 - ioBroker wird **nach** dem Erst-Flash vom Nutzer umkonfiguriert; bis dahin halten
