@@ -69,7 +69,7 @@ static const uint16_t MQTT_RPM_ABS_DELTA    = 50;
 static const unsigned long CLIENT_RD_TIMEOUT = 3000;   // Stall-Budget pro Zeile (< WDT 8s)
 static const unsigned long BODY_RD_TIMEOUT   = 30000;  // Stall-Budget Body/OTA (t0 reset bei Fortschritt)
 static const size_t        LOG_MAX           = 8192;
-static const uint32_t      LOG_FLUSH_MS      = 8000;
+static const uint32_t      LOG_FLUSH_MS      = 600000;  // 10 min — NVS-Wear (Spec §3.5)
 static const size_t        LOG_NVS_MAX       = 1600;
 
 // Storm-Shield & Filter
@@ -1521,7 +1521,7 @@ static void handleClient(EthernetClient &c) {
   size_t contentLength = 0;
   String contentType;
   readHeaders(c, contentLength, contentType);
-  LOGI("HTTP", method + " " + path + (query.length() ? "?" + query : ""));
+  // bewusst KEIN Request-Logging (NVS-Wear + Heap-Churn, Spec §3.5)
 
   // --- GET ---
   if (method == "GET") {
@@ -1652,6 +1652,9 @@ void setup() {
 
   loadPrevLogTail();
   bootTrackInit();
+
+  // Log-Tail bei jedem geordneten Reboot sichern (ESP.restart ruft Handler).
+  esp_register_shutdown_handler([]() { persistLogTail(); });
 
   disableRadios();
   safetyZeroPins();
