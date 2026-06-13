@@ -1,0 +1,204 @@
+<!doctype html><html lang="de"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>FAN-CTRL</title>
+<style>
+:root{--bg:#0a0e12;--panel:#0f141b;--bd:#1f2937;--fg:#e2e8f0;--mut:#64748b;--dim:#475569;
+--ok:#22c55e;--warn:#f59e0b;--err:#ef4444;--acc:#38bdf8}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);
+font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:14px}
+.wrap{max-width:1000px;margin:0 auto;padding:14px}
+header{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;
+border-bottom:1px solid var(--bd);padding-bottom:10px;margin-bottom:2px}
+h1{font-size:15px;margin:0;letter-spacing:.1em}h1 small{color:var(--dim);font-weight:400}
+.leds{display:flex;gap:12px;font-size:11px;color:var(--mut)}
+.led::before{content:"●";margin-right:4px;color:var(--err)}.led.on::before{color:var(--ok)}
+#safebanner{display:none;background:#3a1313;border:1px solid var(--err);color:#fecaca;
+padding:10px;border-radius:6px;margin:10px 0;font-weight:700}
+nav{display:flex;gap:2px;margin-top:12px}
+nav button{font:inherit;font-size:12px;letter-spacing:.08em;padding:7px 14px;cursor:pointer;
+background:none;border:1px solid var(--bd);border-bottom:none;border-radius:6px 6px 0 0;color:var(--dim)}
+nav button.act{background:var(--panel);color:var(--fg)}
+main{background:var(--panel);border:1px solid var(--bd);border-radius:0 6px 6px 6px;padding:14px;min-height:300px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:10px}
+.fan{background:var(--bg);border:1px solid var(--bd);border-left:3px solid var(--ok);border-radius:6px;padding:10px}
+.fan.f3{border-left-color:var(--warn)}.fan.f4,.fan.bad{border-left-color:var(--err)}
+.fan .top{display:flex;justify-content:space-between;font-size:11px;color:#94a3b8}
+.fan .rpm{font-size:26px;font-weight:700;margin:4px 0}.fan .rpm small{font-size:11px;color:var(--dim)}
+.fan input[type=range]{width:100%;accent-color:var(--acc)}
+.fan .pct{font-size:11px;color:var(--mut)}
+.badge{font-size:10px;padding:1px 7px;border-radius:8px;border:1px solid var(--bd)}
+.b-ok{color:#a7f3d0}.b-warn{color:#fde68a}.b-err{color:#fecaca}
+.kv{display:grid;grid-template-columns:max-content 1fr;gap:6px 18px;font-size:13px}
+.kv b{color:var(--mut);font-weight:400}
+pre{background:var(--bg);border:1px solid var(--bd);border-radius:6px;padding:10px;
+white-space:pre-wrap;max-height:45vh;overflow:auto;font-size:11px}
+label{display:block;color:var(--mut);font-size:11px;margin:10px 0 3px;letter-spacing:.05em}
+input[type=text],input[type=password],input[type=number],select{width:100%;max-width:340px;
+font:inherit;padding:7px;background:var(--bg);border:1px solid var(--bd);border-radius:6px;color:var(--fg)}
+.btn{font:inherit;font-size:12px;padding:7px 14px;border:1px solid var(--bd);border-radius:6px;
+background:#16202e;color:var(--fg);cursor:pointer;margin:10px 6px 0 0}
+.btn.danger{background:#2b1515;border-color:#4b1b1b}
+.row{display:flex;gap:16px;flex-wrap:wrap}.col{flex:1;min-width:260px}
+.list{border:1px solid var(--bd);border-radius:6px;margin-top:8px}
+.list>div{display:flex;justify-content:space-between;align-items:center;padding:8px 10px;border-bottom:1px solid var(--bd)}
+.list>div:last-child{border-bottom:none}
+.muted{color:var(--mut)}.small{font-size:11px}
+progress{width:100%;accent-color:var(--acc)}
+hr{border:0;border-top:1px solid var(--bd);margin:16px 0}
+#toast{position:fixed;bottom:16px;right:16px;background:#16202e;border:1px solid var(--bd);
+border-radius:6px;padding:10px 14px;display:none;font-size:12px}
+</style></head><body><div class="wrap">
+<header>
+  <h1>FAN-CTRL <small id="dev">—</small></h1>
+  <div class="leds">
+    <span class="led" id="l-eth">ETH</span><span class="led" id="l-mqtt">MQTT</span>
+    <span class="led" id="l-wdt">WDT</span><span id="l-ip" class="muted"></span>
+  </div>
+</header>
+<div id="safebanner">⚠ SAFE MODE — Crash-Loop erkannt. Lüfter laufen mit 70 % Failsafe, MQTT ist aus.</div>
+<nav>
+  <button data-t="dash" class="act" onclick="tab('dash')">DASHBOARD</button>
+  <button data-t="sys" onclick="tab('sys')">SYSTEM</button>
+  <button data-t="cfg" onclick="tab('cfg')">EINSTELLUNGEN</button>
+  <button data-t="fw" onclick="tab('fw')">FIRMWARE</button>
+</nav>
+<main>
+  <section id="t-dash"><div class="grid" id="fangrid"></div>
+    <p class="muted small" id="nofans" style="display:none">Keine Lüfter konfiguriert — Tab EINSTELLUNGEN.</p></section>
+
+  <section id="t-sys" style="display:none">
+    <div class="kv" id="syskv"></div>
+    <div><button class="btn" onclick="loadLogs()">Logs laden</button>
+      <button class="btn" onclick="if(confirm('ESP jetzt neu starten?'))api('/api/reboot',{},()=>toast('Reboot…'))">Reboot</button>
+      <button class="btn danger" id="srbtn" style="display:none"
+        onclick="api('/api/safemode/reset',{},()=>toast('Safe-Mode zurückgesetzt — Reboot empfohlen'))">Safe-Mode-Reset</button></div>
+    <label>LOG (aktueller Boot)</label><pre id="log">—</pre>
+    <label>LOG (vorheriger Boot)</label><pre id="prevlog">—</pre></section>
+
+  <section id="t-cfg" style="display:none"><div class="row">
+    <div class="col"><h3 class="small" style="letter-spacing:.1em">LÜFTER</h3>
+      <div class="list" id="fanlist"></div>
+      <button class="btn" onclick="api('/api/fan/new',{},j=>{poll(true);toast('Slot '+j.idx+' angelegt')})">+ Neuer Lüfter</button>
+      <div id="editbox" style="display:none"><hr>
+        <h3 class="small">LÜFTER #<span id="e-idx"></span> BEARBEITEN</h3>
+        <label>NAME (a-z 0-9 _ -)</label><input type="text" id="e-name" maxlength="19">
+        <label>PWM-PIN</label><select id="e-pwm"></select>
+        <label>TACHO-PIN</label><select id="e-tach"></select>
+        <label><input type="checkbox" id="e-inv" style="width:auto"> PWM invertieren</label>
+        <button class="btn" onclick="saveFan()">Speichern</button>
+        <button class="btn danger" onclick="delFan()">Löschen</button>
+        <label>KALIBRIERUNG: MIN-START (%)</label><input type="number" id="e-cmin" min="0" max="100" value="0">
+        <label>NOTIZ</label><input type="text" id="e-note" maxlength="39">
+        <button class="btn" onclick="saveCalib()">Kalibrierung speichern</button></div></div>
+    <div class="col"><h3 class="small" style="letter-spacing:.1em">MQTT</h3>
+      <label><input type="checkbox" id="m-en" style="width:auto"> aktiv</label>
+      <label>HOST</label><input type="text" id="m-host">
+      <label>PORT</label><input type="number" id="m-port" value="1883">
+      <label>USER</label><input type="text" id="m-user">
+      <label>PASSWORT</label><input type="password" id="m-pass" placeholder="(unverändert lassen = leer)">
+      <label>PREFIX</label><input type="text" id="m-prefix" maxlength="15">
+      <button class="btn" onclick="saveMqtt()">MQTT speichern</button>
+      <p class="muted small">Topics: prefix/&lt;device&gt;/&lt;name&gt;/speed·set·rpm + …/status</p></div>
+  </div></section>
+
+  <section id="t-fw" style="display:none">
+    <p class="muted small">.bin wählen — Update läuft in den inaktiven Slot; das neue Image
+    muss 90 s gesund laufen, sonst Rollback. Notfall: curl POST /ota.</p>
+    <input type="file" id="fwfile" accept=".bin">
+    <button class="btn" id="fwbtn" onclick="flash()">Upload &amp; Flash</button>
+    <div id="fwbox" style="display:none"><progress id="fwpr" max="100" value="0"></progress>
+      <div class="muted small" id="fwst">Bereit…</div></div>
+    <div class="kv" style="margin-top:12px"><b>OTA-Status</b><span id="otastate">—</span></div></section>
+</main>
+<div id="toast"></div>
+<script>
+"use strict";
+const $=id=>document.getElementById(id);
+const esc=s=>String(s??"").replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[m]));
+let J=null,editIdx=-1,fail=0,mqttLoaded=false;
+function tab(t){document.querySelectorAll("nav button").forEach(b=>b.classList.toggle("act",b.dataset.t===t));
+ ["dash","sys","cfg","fw"].forEach(x=>$("t-"+x).style.display=x===t?"":"none");}
+function toast(m){const t=$("toast");t.textContent=m;t.style.display="block";setTimeout(()=>t.style.display="none",2500);}
+function api(url,data,okCb){const body=Object.entries(data).map(([k,v])=>k+"="+encodeURIComponent(v)).join("&");
+ fetch(url,{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded"},body})
+ .then(r=>r.json()).then(j=>{if(j.ok)okCb&&okCb(j);else toast("Fehler: "+(j.error||"?"));})
+ .catch(()=>toast("Keine Verbindung"));}
+const sliders={t:{},send(i,pct){clearTimeout(this.t[i]);this.t[i]=setTimeout(()=>api("/api/fan/set",{idx:i,pct}),150);}};
+function badge(f){if(!f.validated)return'<span class="badge b-err">CONFIG</span>';
+ if(f.fault===0)return'<span class="badge b-ok">RUN</span>';
+ if(f.fault===3)return'<span class="badge b-warn">NO TACH</span>';
+ if(f.fault===4)return'<span class="badge b-warn">STORM</span>';
+ return'<span class="badge b-err">FAULT '+f.fault+"</span>";}
+function renderDash(){const g=$("fangrid");const fans=J.fans||[];
+ $("nofans").style.display=fans.length?"none":"";
+ const key=fans.map(f=>f.index+":"+f.name+":"+f.fault+":"+f.validated).join("|");
+ if(g.dataset.key!==key){g.dataset.key=key;g.innerHTML="";
+  fans.forEach(f=>{const d=document.createElement("div");
+   d.className="fan f"+f.fault+(f.validated?"":" bad");
+   d.innerHTML=`<div class="top"><span>${String(f.index+1).padStart(2,"0")} ${esc(f.name).toUpperCase()}</span>${badge(f)}</div>`+
+    `<div class="rpm"><span id="r${f.index}">${f.rpm}</span><small> rpm</small></div>`+
+    `<input type="range" id="sl${f.index}" min="0" max="100" value="${f.pct}" oninput="$('p${f.index}').textContent=this.value;sliders.send(${f.index},this.value)">`+
+    `<div class="pct"><span id="p${f.index}">${f.pct}</span>% PWM · Pin ${f.pwmPin}/${f.tachPin}</div>`;
+   g.appendChild(d);});}
+ fans.forEach(f=>{const r=$("r"+f.index);if(r)r.textContent=f.rpm;
+  const sl=$("sl"+f.index);
+  if(sl&&document.activeElement!==sl){sl.value=f.pct;const p=$("p"+f.index);if(p)p.textContent=f.pct;}});}
+function renderSys(){const fmt=s=>{const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);
+  return(d?d+"d ":"")+h+"h "+m+"m"};
+ $("syskv").innerHTML=[["Device",esc(J.device)],["IP",esc(J.ip)],["Uptime",fmt(J.uptime_s||0)],
+  ["Boot-Count",J.boot_count],["Reset-Grund",esc(J.reset_reason)],["Crash-Streak",J.crash_streak],
+  ["Watchdog",J.wdt?"AKTIV":"AUS!"],["OTA",J.ota_pending?"PENDING_VERIFY (Health-Window)":"validiert"],
+  ["Min Free Heap",J.min_free_heap],["Largest Block",J.largest_block]]
+  .map(([k,v])=>`<b>${k}</b><span>${v}</span>`).join("");
+ $("srbtn").style.display=J.safe_mode?"":"none";
+ $("otastate").textContent=J.ota_pending?"PENDING_VERIFY — wird nach 90 s gesundem Lauf validiert":"Image validiert";}
+function renderCfg(){const l=$("fanlist");l.innerHTML="";(J.fans||[]).forEach(f=>{const d=document.createElement("div");
+  d.innerHTML=`<span>${String(f.index+1).padStart(2,"0")} ${esc(f.name)} <span class="muted small">pwm${f.pwmPin} tach${f.tachPin}</span></span>`;
+  const b=document.createElement("button");b.className="btn";b.style.margin="0";b.textContent="edit";
+  b.onclick=()=>editFan(f.index);d.appendChild(b);
+  l.appendChild(d);});
+ if(!mqttLoaded&&J.mqtt){mqttLoaded=true;$("m-en").checked=!!J.mqtt.enabled;$("m-host").value=J.mqtt.host||"";
+  $("m-port").value=J.mqtt.port||1883;$("m-user").value=J.mqtt.user||"";$("m-prefix").value=J.mqtt.prefix||"esp";}}
+function pinOpts(sel,list,current){sel.innerHTML="";[...new Set([current,...list])].filter(p=>p!==undefined&&p!==255)
+ .forEach(p=>{const o=document.createElement("option");o.value=p;o.textContent="GPIO "+p;
+  if(p===current)o.selected=true;sel.appendChild(o);});}
+function editFan(i){editIdx=i;const f=(J.fans||[]).find(x=>x.index===i);if(!f)return;
+ $("editbox").style.display="";$("e-idx").textContent=i;$("e-name").value=f.name;
+ pinOpts($("e-pwm"),J.free_pwm||[],f.pwmPin);pinOpts($("e-tach"),J.free_tach||[],f.tachPin);
+ $("e-inv").checked=false;$("e-cmin").value=f.cmin??0;$("e-note").value=f.cnote??"";}
+function saveFan(){api("/api/fan/save",{idx:editIdx,name:$("e-name").value,pwm:$("e-pwm").value,
+ tach:$("e-tach").value,inv:$("e-inv").checked?1:0},()=>{toast("Gespeichert");poll(true);});}
+function delFan(){if(confirm("Lüfter wirklich löschen?"))
+ api("/api/fan/delete",{idx:editIdx},()=>{$("editbox").style.display="none";toast("Gelöscht");poll(true);});}
+function saveCalib(){api("/api/calib",{idx:editIdx,cmin:$("e-cmin").value,cnote:$("e-note").value},()=>toast("Kalibrierung gespeichert"));}
+function saveMqtt(){api("/api/mqtt",{enabled:$("m-en").checked?1:0,host:$("m-host").value,port:$("m-port").value,
+ user:$("m-user").value,pass:$("m-pass").value,prefix:$("m-prefix").value},()=>toast("MQTT gespeichert"));}
+function loadLogs(){fetch("/log.txt").then(r=>r.text()).then(t=>$("log").textContent=t.split("\n").slice(-300).join("\n"));
+ fetch("/prevlog.txt").then(r=>r.text()).then(t=>$("prevlog").textContent=t);}
+function flash(){const f=$("fwfile").files[0];if(!f){toast("Bitte .bin wählen");return;}
+ $("fwbtn").disabled=true;$("fwbox").style.display="";
+ const x=new XMLHttpRequest();x.open("POST","/ota",true);
+ x.setRequestHeader("Content-Type","application/octet-stream");
+ x.upload.onprogress=e=>{if(e.lengthComputable){const p=Math.round(e.loaded/e.total*100);
+  $("fwpr").value=p;$("fwst").textContent="Upload "+p+"%";}};
+ x.onerror=()=>{$("fwst").textContent="Netzwerkfehler";$("fwbtn").disabled=false;};
+ x.onload=()=>{try{const j=JSON.parse(x.responseText||"{}");
+  if(j.ok){$("fwst").textContent="Flash OK — Reboot, warte auf Gerät…";watchReboot();}
+  else{$("fwst").textContent="Fehler: "+(j.error||"?");$("fwbtn").disabled=false;}}
+  catch(e){$("fwst").textContent="Antwort unlesbar";$("fwbtn").disabled=false;}};
+ x.send(f);}
+function watchReboot(){const b0=J?J.boot_count:0,t0=Date.now();
+ const iv=setInterval(()=>{fetch("/api/status",{cache:"no-store"}).then(r=>r.json()).then(j=>{
+  if(j.boot_count!==b0){clearInterval(iv);$("fwst").textContent="Online: Boot#"+j.boot_count+
+   (j.ota_pending?" — Health-Window läuft (90 s)":"");$("fwbtn").disabled=false;}})
+  .catch(()=>{if(Date.now()-t0>120000){clearInterval(iv);$("fwst").textContent="Gerät meldet sich nicht.";}});},1500);}
+function poll(force){fetch("/api/status",{cache:"no-store"}).then(r=>r.json()).then(j=>{
+  J=j;fail=0;$("l-eth").classList.add("on");
+  $("l-mqtt").classList.toggle("on",!!j.mqtt_connected);$("l-wdt").classList.toggle("on",!!j.wdt);
+  $("dev").textContent=j.device||"—";$("l-ip").textContent=j.ip||"";
+  $("safebanner").style.display=j.safe_mode?"":"none";
+  renderDash();renderSys();if(force||$("t-cfg").style.display==="")renderCfg();})
+ .catch(()=>{if(++fail>=3){$("l-eth").classList.remove("on");$("l-mqtt").classList.remove("on");}});}
+setInterval(poll,1500);poll(true);
+</script></div></body></html>
