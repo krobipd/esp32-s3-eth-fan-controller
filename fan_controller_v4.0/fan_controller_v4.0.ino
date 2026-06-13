@@ -962,6 +962,12 @@ static void httpSend500(EthernetClient &c, const char *msg) {
   c.println(F("Connection: close"));
   c.println(); c.println(msg);
 }
+static void httpSend404(EthernetClient &c) {
+  c.println(F("HTTP/1.1 404 Not Found"));
+  c.println(F("Content-Type: text/plain; charset=UTF-8"));
+  c.println(F("Connection: close"));
+  c.println(); c.println(F("Not found"));
+}
 static void httpSendRedirect(EthernetClient &c, const char *loc) {
   c.println(F("HTTP/1.1 303 See Other"));
   c.print(F("Location: ")); c.println(loc);
@@ -986,12 +992,15 @@ static bool readLine(EthernetClient &c, String &out, unsigned long timeoutMs) {
   return (out.length() > 0);
 }
 
-static void readHeaders(EthernetClient &c, size_t &contentLength, String &contentType) {
+static bool readHeaders(EthernetClient &c, size_t &contentLength, String &contentType) {
   contentLength = 0;
   contentType   = "";
   bool teChunked = false;
   String h;
-  while (readLine(c, h, CLIENT_RD_TIMEOUT) && h.length() > 0) {
+  uint8_t nHdr = 0;
+  bool terminated = false;
+  while (nHdr++ < 32 && readLine(c, h, CLIENT_RD_TIMEOUT)) {
+    if (h.length() == 0) { terminated = true; break; }
     String hl = h; hl.toLowerCase();
     if (hl.startsWith(F("content-length:"))) {
       String s = h.substring(h.indexOf(':') + 1); s.trim();
@@ -1004,6 +1013,7 @@ static void readHeaders(EthernetClient &c, size_t &contentLength, String &conten
     }
   }
   if (teChunked) contentLength = 0;
+  return terminated;
 }
 
 // [B2] Buffer-Overflow fix: read max sizeof(b)-1 damit b[rd]=0 sicher ist
@@ -1030,6 +1040,7 @@ static bool handleBodyToString(EthernetClient &c, size_t contentLength, String &
 // Inline function-pointer statt typedef (Arduino autoproto Kompatibilitaet)
 static bool handleFormPost(EthernetClient &c, size_t contentLength, const String &contentType,
                            void (*handler)(EthernetClient &, const String &)) {
+  if (contentLength == 0 || contentLength > 4096) { httpSend400(c, "bad length"); return false; }
   if (!contentType.startsWith(F("application/x-www-form-urlencoded"))) {
     httpSend400(c, "Unsupported Content-Type");
     return false;
@@ -1325,8 +1336,19 @@ static void renderDiag(EthernetClient &c) {
   uiFooter(c);
 }
 
-static void handleLogTxt(EthernetClient &c)     { httpSendHeaderOK(c, "text/plain; charset=UTF-8"); c.print(gLogBuf); }
-static void handlePrevLogTxt(EthernetClient &c)  { httpSendHeaderOK(c, "text/plain; charset=UTF-8"); c.print(gPrevLogTail); }
+// EthernetClient::write() kappt still bei Socket-Puffergroesse (4KB) und meldet
+// trotzdem Erfolg -> NIE mehr als 1KB pro write() schicken (CLAUDE.md §6.11).
+static void printChunked(EthernetClient &c, const char *s, size_t len) {
+  while (len > 0) {
+    size_t n = len < 1024 ? len : 1024;
+    if (c.write((const uint8_t *)s, n) == 0) return;
+    s += n; len -= n;
+    feedLoopWDT();
+  }
+}
+
+static void handleLogTxt(EthernetClient &c)     { httpSendHeaderOK(c, "text/plain; charset=UTF-8"); printChunked(c, gLogBuf.c_str(), gLogBuf.length()); }
+static void handlePrevLogTxt(EthernetClient &c)  { httpSendHeaderOK(c, "text/plain; charset=UTF-8"); printChunked(c, gPrevLogTail.c_str(), gPrevLogTail.length()); }
 
 // ==== JSON Status ====
 static void sendJsonStatus(EthernetClient &c) {
@@ -1375,6 +1397,12 @@ static bool handleOTA(EthernetClient &c, size_t contentLength) {
     httpSendHeaderOK(c, "application/json; charset=UTF-8");
     c.print(F("{\"ok\":false,\"error\":\"No Content or chunked unsupported\"}"));
     LOGE("OTA", "no content/chunked");
+    return false;
+  }
+  if (contentLength > 0x200000) {  // > 2 MB passt in keinen App-Slot
+    httpSendHeaderOK(c, "application/json; charset=UTF-8");
+    c.print(F("{\"ok\":false,\"error\":\"too large\"}"));
+    LOGE("OTA", "too large");
     return false;
   }
   if (!Update.begin(contentLength)) {
@@ -1520,7 +1548,7 @@ static void handleClient(EthernetClient &c) {
 
   size_t contentLength = 0;
   String contentType;
-  readHeaders(c, contentLength, contentType);
+  if (!readHeaders(c, contentLength, contentType)) { httpSend400(c, "bad headers"); return; }
   // bewusst KEIN Request-Logging (NVS-Wear + Heap-Churn, Spec §3.5)
 
   // --- GET ---
@@ -1583,7 +1611,7 @@ static void handleClient(EthernetClient &c) {
     }
   }
 
-  httpSend400(c, "Not found");
+  httpSend404(c);
 }
 
 // ==== Ethernet State ====
