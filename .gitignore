@@ -1,5 +1,15 @@
+# Session-/Tool-Cruft
 .superpowers/
 .remember/
+.claude/
 .DS_Store
+
+# Datenblätter / Bilder (Copyright, groß)
 *.pdf
 *.jpg
+
+# Arduino-Build-Artefakte (werden lokal/CI erzeugt)
+build/
+*.map
+*.elf
+*.bin
