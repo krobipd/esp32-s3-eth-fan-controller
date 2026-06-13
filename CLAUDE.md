@@ -67,7 +67,14 @@ Per read-only HTTP-Probe + Quellcode-Abgleich ermittelt:
 
 | Datei / Ordner | Inhalt |
 |---|---|
-| `fan_controller_v3.3/fan_controller_v3.3.ino` | **Aktuellster Code-Stand** (1811 Z.), Referenz-Basis |
+| `fan_controller_v4.0/fan_controller_v4.0.ino` | **Aktueller Entwicklungsstand** (Stufe 1: gehärtet + neues UI). Branch `v4.0-stufe1`. Noch NICHT geflasht. |
+| `fan_controller_v4.0/fw_util.h` | Pure, host-getestete Logik (wrap-sichere Zeit, %-Mapping, Namens-Validierung) |
+| `fan_controller_v4.0/ui_asset.h` | GENERIERT aus `ui/index.html` via `tools/build_ui.sh` (gzip, PROGMEM) |
+| `ui/index.html` | Web-UI (Control-Room, Tabs; gegen `tools/mock_api.py` testbar) |
+| `tools/build_ui.sh`, `tools/mock_api.py` | UI-Build + Mock-API für gerätelose Entwicklung |
+| `tests/host/test_logic.cpp` | Host-Unit-Tests für `fw_util.h` |
+| `docs/superpowers/specs/…`, `docs/superpowers/plans/…`, `docs/flash-checklist.md` | Spec, Implementierungsplan, Flash-Checkliste |
+| `fan_controller_v3.3/fan_controller_v3.3.ino` | Referenz-Basis (1811 Z.), Vorgänger von v4.0 |
 | `ESP32_FanController_v3.1_FINAL/...ino` | Älterer Stand (2049 Z.); v3.3 ist die bereinigte Weiterentwicklung |
 | `ESP32-S3-ETH-details-15.jpg` | Pinout-Diagramm des Boards (sehr nützlich) |
 | `ESP32-S3-ETH-Schematic.pdf` | Schaltplan |
