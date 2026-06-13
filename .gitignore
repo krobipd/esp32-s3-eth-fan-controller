@@ -1,0 +1,17 @@
+# Session-/Tool-Cruft (interne Arbeitsdateien, nicht öffentlich)
+.superpowers/
+.remember/
+.claude/
+CLAUDE.md
+docs/flash-checklist.md
+.DS_Store
+
+# Datenblätter / Bilder (Copyright, groß)
+*.pdf
+*.jpg
+
+# Arduino-Build-Artefakte (werden lokal/CI erzeugt)
+build/
+*.map
+*.elf
+*.bin
