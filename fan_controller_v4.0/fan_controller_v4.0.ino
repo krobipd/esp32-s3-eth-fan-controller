@@ -447,7 +447,8 @@ static void stateScheduleDutySave(uint8_t idx, uint8_t duty) {
   if (g_lastSavedDuty[idx] != duty) g_stateDirty[idx] = true;
 }
 static void stateFlushIfNeeded(uint32_t now) {
-  if (now - g_lastStateWriteMs < STATE_WRITE_DEBOUNCE_MS) return;
+  if (g_crashLoopDetected) return;  // Safe-Mode-Failsafe-Duties nie in NVS schreiben
+  if (!elapsed(now, g_lastStateWriteMs, STATE_WRITE_DEBOUNCE_MS)) return;
   Preferences p; p.begin("state", false);
   bool wrote = false;
   for (uint8_t i = 0; i < MAX_FANS; i++) {
@@ -1640,8 +1641,16 @@ void setup() {
 
   rebuildPcntMap();
 
-  // [B1] Gespeicherte Duties wiederherstellen (Hardware ist bereits auf 0)
-  restoreSavedDuties();
+  // [Spec §3.4/3.7] Luefter drehen BEVOR das Netz initialisiert wird.
+  if (g_crashLoopDetected) {
+    // SAFE MODE: feste 70 % Failsafe, kein Restore, MQTT bleibt aus (loop).
+    for (uint8_t i = 0; i < MAX_FANS; i++)
+      if (fanPresentIdx(i)) dutyEnqueue(i, dutyFromPct(70));
+    LOGW("SAFE", "crash loop erkannt -> Failsafe 70%, MQTT aus");
+  } else {
+    restoreSavedDuties();  // [B1] (Hardware ist bereits auf 0)
+  }
+  dutyProcessQueue();
 
   // [B7] W5500 Ethernet — resetW5500() macht SPI.begin + Ethernet.init
   resetW5500();
@@ -1725,7 +1734,7 @@ void loop() {
   }
 
   // --- MQTT ---
-  if (mqttConfig.enabled && ethHasIP) {
+  if (mqttConfig.enabled && ethHasIP && !g_crashLoopDetected) {
     mqttEnsureConnected();
     if (mqtt.connected()) mqtt.loop();
   }
