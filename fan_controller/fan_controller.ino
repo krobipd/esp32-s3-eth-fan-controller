@@ -15,12 +15,12 @@ struct ApplyJob;
 // ==== Includes ====
 #include <Arduino.h>
 #include <SPI.h>
-#include <Ethernet.h>
 #include <Update.h>
 #include <PubSubClient.h>
 #include <Preferences.h>
 
 #include "fw_util.h"
+#include "net_eth.h"   // nativer W5500-Treiber (ETH.h) + Link-Events; ersetzt Ethernet.h
 
 #include "esp_wifi.h"
 #include "esp_bt.h"
@@ -45,12 +45,7 @@ extern "C" bool verifyRollbackLater() { return true; }
 static bool g_otaPendingVerify = false;
 static const uint32_t OTA_HEALTH_MS = 90000;
 
-// ==== Board-Pins (Waveshare ESP32-S3-ETH, W5500) ====
-#define ETH_MISO 12
-#define ETH_MOSI 11
-#define ETH_SCLK 13
-#define ETH_CS   14
-#define ETH_RST   9
+// W5500-Board-Pins liegen jetzt in net_eth.h (ETH_PIN_*/ETH_SPI_*).
 
 // ==== Limits & Timing ====
 static const uint8_t  MAX_FANS              = 8;
@@ -88,11 +83,9 @@ static const uint16_t PCNT_FILTER_CYCLES = 800;
 static const uint8_t  CRASH_LOOP_LIMIT       = 3;
 static const uint32_t STATE_WRITE_DEBOUNCE_MS = 2500;
 
-// Ethernet
-static const unsigned long DHCP_RETRY_MS           = 3000;
+// Ethernet (nativer ETH.h-Treiber; DHCP/Lease-Erneuerung macht esp-netif selbst)
 static const uint32_t      ETH_REINIT_COOLDOWN_MS  = 5000;
 static const uint32_t      ETH_LINK_LOST_RESET_MS  = 15000;
-static const uint32_t      ETH_MAINTAIN_INTERVAL_MS = 10000;
 
 // ==== Pin-Listen (Waveshare ESP32-S3-ETH) ====
 // Geblockt: W5500 (9-14), USB CDC (19-20), Strapping (0,3,43-46)
@@ -378,10 +371,10 @@ static void fanAutoValidate(uint8_t idx) {
 // ==== Globaler State ====
 static uint32_t g_stateRev = 0;
 
-// ==== Ethernet/MQTT Objects ====
-EthernetServer httpServer(80);
-EthernetClient ethClient;
-PubSubClient   mqtt(ethClient);
+// ==== Netz/MQTT-Objekte (nativer ETH.h-Stack) ====
+NetworkServer  httpServer(80);
+NetworkClient  mqttNetClient;        // TCP-Socket fuer PubSubClient ueber lwIP/esp-netif
+PubSubClient   mqtt(mqttNetClient);
 
 // ==== MQTT Helpers ====
 static String topicDev() { return String(mqttConfig.prefix) + "/" + deviceId; }
@@ -434,17 +427,7 @@ static void disableRadios() {
 }
 
 // ==== W5500 Reset ====
-static void resetW5500() {
-  pinMode(ETH_RST, OUTPUT);
-  digitalWrite(ETH_RST, LOW);
-  delay(50);
-  digitalWrite(ETH_RST, HIGH);
-  delay(200);
-  SPI.end();
-  SPI.begin(ETH_SCLK, ETH_MISO, ETH_MOSI, ETH_CS);
-  SPI.setFrequency(20000000);
-  Ethernet.init(ETH_CS);
-}
+// W5500-Reset/Init liegt jetzt in net_eth.h: ethBegin() / ethHardReset().
 
 // ==== Duty-State Persistenz ====
 static uint8_t  g_lastSavedDuty[MAX_FANS] = {0};
@@ -511,7 +494,7 @@ static void loadMQTTConfig() {
 }
 
 // ==== JSON Helpers ====
-static void jsonPrintEscaped(EthernetClient &c, const char *s) {
+static void jsonPrintEscaped(NetworkClient &c, const char *s) {
   c.print('"');
   for (const char *p = s; *p; ++p) {
     char ch = *p;
@@ -945,7 +928,7 @@ static void applyDo(uint8_t idx) {
 }
 
 // ==== HTTP Basics ====
-static void httpSendHeaderOK(EthernetClient &c, const char *ctype) {
+static void httpSendHeaderOK(NetworkClient &c, const char *ctype) {
   c.println(F("HTTP/1.1 200 OK"));
   c.print(F("Content-Type: ")); c.println(ctype);
   c.println(F("Cache-Control: no-cache, no-store, must-revalidate"));
@@ -953,26 +936,26 @@ static void httpSendHeaderOK(EthernetClient &c, const char *ctype) {
   c.println(F("Connection: close"));
   c.println();
 }
-static void httpSend400(EthernetClient &c, const char *msg) {
+static void httpSend400(NetworkClient &c, const char *msg) {
   c.println(F("HTTP/1.1 400 Bad Request"));
   c.println(F("Content-Type: text/plain; charset=UTF-8"));
   c.println(F("Connection: close"));
   c.println(); c.println(msg);
 }
-static void httpSend500(EthernetClient &c, const char *msg) {
+static void httpSend500(NetworkClient &c, const char *msg) {
   c.println(F("HTTP/1.1 500 Internal Server Error"));
   c.println(F("Content-Type: text/plain; charset=UTF-8"));
   c.println(F("Connection: close"));
   c.println(); c.println(msg);
 }
-static void httpSend404(EthernetClient &c) {
+static void httpSend404(NetworkClient &c) {
   c.println(F("HTTP/1.1 404 Not Found"));
   c.println(F("Content-Type: text/plain; charset=UTF-8"));
   c.println(F("Connection: close"));
   c.println(); c.println(F("Not found"));
 }
 // ==== UI-Asset (gzip im Flash, chunked) ====
-static void sendUiAsset(EthernetClient &c) {
+static void sendUiAsset(NetworkClient &c) {
   c.println(F("HTTP/1.1 200 OK"));
   c.println(F("Content-Type: text/html; charset=UTF-8"));
   c.println(F("Content-Encoding: gzip"));
@@ -990,11 +973,11 @@ static void sendUiAsset(EthernetClient &c) {
 }
 
 // ==== JSON-API-Antwort-Helfer ====
-static void apiOk(EthernetClient &c) {
+static void apiOk(NetworkClient &c) {
   httpSendHeaderOK(c, "application/json; charset=UTF-8");
   c.print(F("{\"ok\":true}"));
 }
-static void apiErr(EthernetClient &c, const char *msg) {  // nur statische msg!
+static void apiErr(NetworkClient &c, const char *msg) {  // nur statische msg!
   c.println(F("HTTP/1.1 400 Bad Request"));
   c.println(F("Content-Type: application/json; charset=UTF-8"));
   c.println(F("Connection: close"));
@@ -1005,7 +988,7 @@ static void apiErr(EthernetClient &c, const char *msg) {  // nur statische msg!
 // Gesamtbudget des aktuellen Nicht-OTA-Requests (Spec §3.1). In handleClient gesetzt.
 static uint32_t g_reqStart = 0;
 
-static bool readLine(EthernetClient &c, String &out, unsigned long timeoutMs) {
+static bool readLine(NetworkClient &c, String &out, unsigned long timeoutMs) {
   out = "";
   unsigned long t0 = millis();
   while (!elapsed(millis(), t0, timeoutMs) && !elapsed(millis(), g_reqStart, HTTP_REQ_BUDGET_MS)) {
@@ -1022,7 +1005,7 @@ static bool readLine(EthernetClient &c, String &out, unsigned long timeoutMs) {
   return (out.length() > 0);
 }
 
-static bool readHeaders(EthernetClient &c, size_t &contentLength, String &contentType) {
+static bool readHeaders(NetworkClient &c, size_t &contentLength, String &contentType) {
   contentLength = 0;
   contentType   = "";
   bool teChunked = false;
@@ -1047,7 +1030,7 @@ static bool readHeaders(EthernetClient &c, size_t &contentLength, String &conten
 }
 
 // [B2] Buffer-Overflow fix: read max sizeof(b)-1 damit b[rd]=0 sicher ist
-static bool handleBodyToString(EthernetClient &c, size_t contentLength, String &out) {
+static bool handleBodyToString(NetworkClient &c, size_t contentLength, String &out) {
   out.reserve(contentLength + 8);
   size_t got = 0;
   unsigned long t0 = millis();
@@ -1070,8 +1053,8 @@ static bool handleBodyToString(EthernetClient &c, size_t contentLength, String &
 
 // ==== DRY: POST-Body Dispatcher ====
 // Inline function-pointer statt typedef (Arduino autoproto Kompatibilitaet)
-static bool handleFormPost(EthernetClient &c, size_t contentLength, const String &contentType,
-                           void (*handler)(EthernetClient &, const String &)) {
+static bool handleFormPost(NetworkClient &c, size_t contentLength, const String &contentType,
+                           void (*handler)(NetworkClient &, const String &)) {
   if (contentLength == 0 || contentLength > 4096) { httpSend400(c, "bad length"); return false; }
   if (!contentType.startsWith(F("application/x-www-form-urlencoded"))) {
     httpSend400(c, "Unsupported Content-Type");
@@ -1087,9 +1070,9 @@ static bool handleFormPost(EthernetClient &c, size_t contentLength, const String
 }
 
 
-// EthernetClient::write() kappt still bei Socket-Puffergroesse (4KB) und meldet
+// NetworkClient::write() kappt still bei Socket-Puffergroesse (4KB) und meldet
 // trotzdem Erfolg -> NIE mehr als 1KB pro write() schicken (CLAUDE.md §6.11).
-static void printChunked(EthernetClient &c, const char *s, size_t len) {
+static void printChunked(NetworkClient &c, const char *s, size_t len) {
   while (len > 0) {
     size_t n = len < 1024 ? len : 1024;
     if (c.write((const uint8_t *)s, n) == 0) return;
@@ -1098,15 +1081,15 @@ static void printChunked(EthernetClient &c, const char *s, size_t len) {
   }
 }
 
-static void handleLogTxt(EthernetClient &c)     { httpSendHeaderOK(c, "text/plain; charset=UTF-8"); printChunked(c, gLogBuf.c_str(), gLogBuf.length()); }
-static void handlePrevLogTxt(EthernetClient &c)  { httpSendHeaderOK(c, "text/plain; charset=UTF-8"); printChunked(c, gPrevLogTail.c_str(), gPrevLogTail.length()); }
+static void handleLogTxt(NetworkClient &c)     { httpSendHeaderOK(c, "text/plain; charset=UTF-8"); printChunked(c, gLogBuf.c_str(), gLogBuf.length()); }
+static void handlePrevLogTxt(NetworkClient &c)  { httpSendHeaderOK(c, "text/plain; charset=UTF-8"); printChunked(c, gPrevLogTail.c_str(), gPrevLogTail.length()); }
 
 // ==== JSON Status ====
-static void sendJsonStatus(EthernetClient &c) {
+static void sendJsonStatus(NetworkClient &c) {
   httpSendHeaderOK(c, "application/json");
   c.print(F("{\"rev\":")); c.print(g_stateRev);
   c.print(F(",\"device\":")); jsonPrintEscaped(c, deviceId.c_str());
-  c.print(F(",\"ip\":")); jsonPrintEscaped(c, Ethernet.localIP().toString().c_str());
+  c.print(F(",\"ip\":")); jsonPrintEscaped(c, ethLocalIp().c_str());
   c.print(F(",\"mqtt_connected\":")); c.print(mqtt.connected() ? "true" : "false");
   c.print(F(",\"boot_count\":")); c.print(g_bootCount);
   c.print(F(",\"safe_mode\":")); c.print(g_crashLoopDetected ? "true" : "false");
@@ -1187,7 +1170,7 @@ static void prepareRestart() {
 }
 
 // ==== OTA ====
-static bool handleOTA(EthernetClient &c, size_t contentLength) {
+static bool handleOTA(NetworkClient &c, size_t contentLength) {
   // [Review-Fund 2] Laufendes Image zuerst gueltig markieren: es bedient gerade einen
   // OTA-Upload, ist also gesund. Sonst ruft Update.end()->set_boot_partition() aus einem
   // noch PENDING_VERIFY-Zustand (unklare Rollback-Ecke beim OTA INNERHALB des Health-Windows).
@@ -1254,7 +1237,7 @@ static bool handleOTA(EthernetClient &c, size_t contentLength) {
 }
 
 // ==== JSON-API-Handler (schreibend -> Queues) ====
-static void apiFanSet(EthernetClient &c, const String &body) {
+static void apiFanSet(NetworkClient &c, const String &body) {
   String s; long idx = -1, pct = -1;
   if (formGet(body, F("idx"), s)) idx = s.toInt();
   if (formGet(body, F("pct"), s)) pct = s.toInt();
@@ -1265,7 +1248,7 @@ static void apiFanSet(EthernetClient &c, const String &body) {
   apiOk(c);
 }
 
-static void apiFanSave(EthernetClient &c, const String &body) {
+static void apiFanSave(NetworkClient &c, const String &body) {
   String s;
   if (!formGet(body, F("idx"), s) && !formGet(body, F("fan"), s)) { apiErr(c, "missing idx"); return; }
   int idx = s.toInt();
@@ -1297,7 +1280,7 @@ static void apiFanSave(EthernetClient &c, const String &body) {
   apiOk(c);
 }
 
-static void apiFanDelete(EthernetClient &c, const String &body) {
+static void apiFanDelete(NetworkClient &c, const String &body) {
   String s;
   if (!formGet(body, F("idx"), s)) { apiErr(c, "missing idx"); return; }
   int idx = s.toInt();
@@ -1307,7 +1290,7 @@ static void apiFanDelete(EthernetClient &c, const String &body) {
   apiOk(c);
 }
 
-static void apiFanNew(EthernetClient &c, const String &body) {
+static void apiFanNew(NetworkClient &c, const String &body) {
   (void)body;
   int idx = -1;  // [B8] freie Slots an pwmPin==0xFF erkennen
   for (uint8_t i = 0; i < MAX_FANS; i++) if (fans[i].pwmPin == 0xFF) { idx = i; break; }
@@ -1320,7 +1303,7 @@ static void apiFanNew(EthernetClient &c, const String &body) {
   c.print(F("{\"ok\":true,\"idx\":")); c.print(idx); c.print(F("}"));
 }
 
-static void apiCalib(EthernetClient &c, const String &body) {
+static void apiCalib(NetworkClient &c, const String &body) {
   String s;
   if (!formGet(body, F("idx"), s)) { apiErr(c, "missing idx"); return; }
   int idx = s.toInt();
@@ -1336,7 +1319,7 @@ static void apiCalib(EthernetClient &c, const String &body) {
   apiOk(c);
 }
 
-static void apiMqttSave(EthernetClient &c, const String &body) {
+static void apiMqttSave(NetworkClient &c, const String &body) {
   String s;
   mqttConfig.enabled = body.indexOf(F("enabled=1")) >= 0;
   if (formGet(body, F("host"),   s)) safeStrcpy(mqttConfig.host,   sizeof(mqttConfig.host),   s);
@@ -1357,7 +1340,7 @@ static void apiMqttSave(EthernetClient &c, const String &body) {
   apiOk(c);
 }
 
-static void apiSafeModeReset(EthernetClient &c, const String &body) {
+static void apiSafeModeReset(NetworkClient &c, const String &body) {
   (void)body;
   Preferences p; p.begin("sys", false);
   p.putUChar("crash_streak", 0);
@@ -1366,7 +1349,7 @@ static void apiSafeModeReset(EthernetClient &c, const String &body) {
   apiOk(c);  // wirkt vollstaendig nach dem naechsten Reboot
 }
 
-static void apiReboot(EthernetClient &c, const String &body) {
+static void apiReboot(NetworkClient &c, const String &body) {
   (void)body;
   apiOk(c);
   c.flush();
@@ -1376,7 +1359,7 @@ static void apiReboot(EthernetClient &c, const String &body) {
 }
 
 // ==== Router ====
-static void handleClient(EthernetClient &c) {
+static void handleClient(NetworkClient &c) {
   g_reqStart = millis();  // [Spec §3.1] 10s-Gesamtbudget ab erster Zeile (OTA-Body liest direkt via c.read())
   String rl;
   if (!readLine(c, rl, CLIENT_RD_TIMEOUT)) return;
@@ -1420,9 +1403,7 @@ static void handleClient(EthernetClient &c) {
 }
 
 // ==== Ethernet State ====
-static unsigned long lastDhcpTryMs = 0;
 static uint32_t g_linkLostSince = 0, g_lastEthReinit = 0;
-static uint32_t g_lastEthMaintainMs = 0;
 
 // ==== setup() helpers ====
 static void ledcInitAllPresentToZero() {
@@ -1518,22 +1499,11 @@ void setup() {
   }
   dutyProcessQueue();
 
-  // [B7] W5500 Ethernet — resetW5500() macht SPI.begin + Ethernet.init
-  // [Review-Fund D] WDT um die langsamen Schritte (W5500-Reset ~250ms, DHCP bis 4s)
-  // explizit fuettern: enableLoopWDT() ist aktiv, setup() laeuft im Loop-Task (8s-Budget).
+  // [Stufe2/1] Nativer W5500-Treiber (ETH.h). DHCP laeuft async; das GOT_IP-Event
+  // setzt g_ethHasIp; httpServer wird in loop() gestartet, sobald die IP da ist.
   feedLoopWDT();
-  resetW5500();
+  if (!ethBegin()) LOGE("NET", "ETH.begin failed");
   feedLoopWDT();
-
-  if (Ethernet.begin(g_mac, 4000, 1200)) {
-    ethHasIP = true;
-    httpServer.begin();
-    httpUp = true;
-    LOGI("NET", String("W5500 OK - IP: ") + Ethernet.localIP().toString());
-  } else {
-    ethHasIP = false;
-    LOGW("NET", "DHCP failed - retry in loop()");
-  }
 
   LOGI("BOOT", "Setup complete.");
 }
@@ -1565,40 +1535,28 @@ void loop() {
   // --- Duty-Queue ---
   dutyProcessQueue();
 
-  // --- Ethernet/DHCP/Link-Watch ---
-  if (!ethHasIP) {
-    if (Ethernet.linkStatus() == LinkON && (now - lastDhcpTryMs) > DHCP_RETRY_MS) {
-      lastDhcpTryMs = now;
-      if (Ethernet.begin(g_mac, 4000, 1200)) {
-        ethHasIP = true;
-        if (!httpUp) { httpServer.begin(); httpUp = true; }
-        LOGI("NET", String("IP: ") + Ethernet.localIP().toString());
-      } else {
-        LOGW("NET", "DHCP retry failed");
-      }
+  // --- Netz-Status aus async Link-Events (ETH.h) ---
+  bool ipNow = ethHasIp();
+  if (ipNow && !httpUp) { httpServer.begin(); httpUp = true; LOGI("NET", String("IP: ") + ethLocalIp()); }
+  if (!ipNow && httpUp && !ethLinkUp()) httpUp = false;  // Link weg -> Server pausiert
+  ethHasIP = ipNow;
+  // Link > 15 s weg -> harter Treiber-Reset (Cooldown 5 s). DHCP-Lease erneuert esp-netif selbst.
+  if (!ethLinkUp()) {
+    if (g_linkLostSince == 0) g_linkLostSince = now;
+    if (elapsed(now, g_linkLostSince, ETH_LINK_LOST_RESET_MS) && elapsed(now, g_lastEthReinit, ETH_REINIT_COOLDOWN_MS)) {
+      LOGW("NET", "link down >15s -> ETH hard reset");
+      g_lastEthReinit = now;
+      mqttWasConnected = false;
+      httpUp = false;
+      ethHardReset();
     }
   } else {
-    if (now - g_lastEthMaintainMs >= ETH_MAINTAIN_INTERVAL_MS) {
-      g_lastEthMaintainMs = now;
-      Ethernet.maintain();
-    }
-    if (Ethernet.linkStatus() != LinkON) {
-      if (g_linkLostSince == 0) g_linkLostSince = now;
-      if ((now - g_linkLostSince) > ETH_LINK_LOST_RESET_MS && (now - g_lastEthReinit) > ETH_REINIT_COOLDOWN_MS) {
-        LOGW("NET", "Link down too long -> W5500 reset");
-        ethHasIP = false;
-        mqttWasConnected = false;
-        g_lastEthReinit = now;
-        resetW5500();
-      }
-    } else {
-      g_linkLostSince = 0;
-    }
+    g_linkLostSince = 0;
   }
 
   // --- HTTP Server ---
   if (httpUp && ethHasIP) {
-    EthernetClient c = httpServer.available();
+    NetworkClient c = httpServer.accept();
     if (c) {
       unsigned long t0 = now;
       while (c.connected() && !c.available() && !elapsed(millis(), t0, 400)) { feedLoopWDT(); delay(1); }
