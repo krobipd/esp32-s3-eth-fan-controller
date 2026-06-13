@@ -1281,7 +1281,7 @@ static void apiFanSave(EthernetClient &c, const String &body) {
     if (sanitizeName(fans[i].name) == cleanName) { apiErr(c, "name in use"); return; }
   }
 
-  bool inv = false;
+  bool inv = f.invertPwm;  // Default = Ist-Zustand: fehlt das Feld (Nicht-UI-Client), bleibt invert erhalten
   if (formGet(body, F("inv"), s)) inv = (s.toInt() == 1);
   uint8_t newPwm = f.pwmPin, newTac = f.tachPin;
   if (formGet(body, F("pwm"),  s)) newPwm = (uint8_t)constrain(s.toInt(), 0, 255);

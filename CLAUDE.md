@@ -500,14 +500,20 @@ HTTP → MQTT → Storm-Recovery → RPM-Messung → Persistenz. `delay(2)` am E
 ~4250-B-Puffer-Bug; Consumer = ioBroker; Prioritäten = Zuverlässigkeit > UI > Architektur;
 Defekt = kaputtes Dashboard/OTA/Diag durch Seiten-Truncation.
 
+**Geklärt/erledigt (Stand 13.06.2026):**
+- Vorgehen = **zweistufig** (Spec): Stufe 1 = v3.3 härten + neues UI (FERTIG, Branch
+  `v4.0-stufe1`, kompiliert, host-getestet, adversarial reviewt + re-verifiziert). Stufe 2
+  (FreeRTOS/2. Core, nativer ETH.h, esp-mqtt, Auth) ist ein späteres eigenes Design.
+- Build-Setup: arduino-cli läuft (FQBN verifiziert, §4). Erst-Flash-Weg = **OTA-POST** auf
+  Altfirmware (Checkliste `docs/flash-checklist.md`).
+- MQTT-Schema = **neu + flach** (Nutzer-Entscheidung): `<prefix>/<deviceId>/<name>/speed|set|rpm`
+  + `…/status`. ioBroker wird nach dem Flash nachgezogen.
+
 **Noch offen:**
-- Soll die neue Firmware auf **v3.3 aufsetzen** (klar beste Basis) oder soll vorher
-  noch eine größere Architektur-Überarbeitung (FreeRTOS/2. Core, Auth) rein?
-- Build-Setup: **arduino-cli** lokal einrichten, damit Claude kompilieren kann?
-  (Toolchain ESP32 Core 3.3.5; Flashen per USB oder via OTA-Endpoint.)
-- Erst-Flash-Weg: USB (sicher) vs. direkter OTA-POST (Hypothese, ungetestet).
-- ioBroker-Anbindung: ob Topic-Struktur beibehalten oder modernisiert wird, ist eine
-  offene Entscheidung des Nutzers (laufend: `<prefix>/<fan>/pwm|rpm|cmd/pwm`, 0..255).
+- **Erst-Flash von v4.0 freigeben** (der eine ungeschützte Schritt; Altfirmware ohne
+  Health-Window) + ioBroker auf das neue Topic-Schema umstellen.
+- Am Gerät zu beweisen (Build kann das nicht): Rollback-Test (Checkliste §6.4) + OTA-im-90s-
+  Fenster-Roundtrip + 24-h-`largest_block`-Beobachtung.
 
 ## 8. Arbeitsweise / Konventionen
 
