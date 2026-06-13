@@ -1548,7 +1548,7 @@ void loop() {
 
   // --- Netz-Status aus async Link-Events (ETH.h) ---
   bool ipNow = ethHasIp();
-  if (ipNow && !httpUp) { httpServer.begin(); httpUp = true; LOGI("NET", String("IP: ") + ethLocalIp()); }
+  if (ipNow && !httpUp) { httpServer.begin(); ethStartMdns(); httpUp = true; LOGI("NET", String("IP: ") + ethLocalIp()); }
   if (!ipNow && httpUp && !ethLinkUp()) httpUp = false;  // Link weg -> Server pausiert
   ethHasIP = ipNow;
   // Link > 15 s weg -> harter Treiber-Reset (Cooldown 5 s). DHCP-Lease erneuert esp-netif selbst.
