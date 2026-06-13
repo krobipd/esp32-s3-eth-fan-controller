@@ -83,3 +83,7 @@ inkl. Rollback-Test und „kein Power-Cycle in den ersten 90 s".
 **Stufe 2** (späteres eigenes Design): Dual-Core/FreeRTOS-Trennung von Netz und
 Steuer-/Messloop, nativer `ETH.h`-W5500-Treiber, thread-sicherer MQTT-Client,
 optional Authentifizierung.
+
+## Lizenz
+
+[MIT](LICENSE) — ohne Gewähr. Firmware für eigene Hardware; Nutzung auf eigenes Risiko.
