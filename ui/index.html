@@ -79,7 +79,7 @@ border-radius:6px;padding:10px 14px;display:none;font-size:12px}
   <section id="t-cfg" style="display:none"><div class="row">
     <div class="col"><h3 class="small" style="letter-spacing:.1em">LÜFTER</h3>
       <div class="list" id="fanlist"></div>
-      <button class="btn" onclick="api('/api/fan/new',{},j=>{poll(true);toast('Slot '+j.idx+' angelegt')})">+ Neuer Lüfter</button>
+      <button class="btn" onclick="api('/api/fan/new',{},j=>poll(true).then(()=>{editFan(j.idx);toast('Neuer Slot — bitte Pins zuweisen')}))">+ Neuer Lüfter</button>
       <div id="editbox" style="display:none"><hr>
         <h3 class="small">LÜFTER #<span id="e-idx"></span> BEARBEITEN</h3>
         <label>NAME (a-z 0-9 _ -)</label><input type="text" id="e-name" maxlength="19">
@@ -130,7 +130,7 @@ function badge(f){if(!f.validated)return'<span class="badge b-err">CONFIG</span>
  if(f.fault===3)return'<span class="badge b-warn">NO TACH</span>';
  if(f.fault===4)return'<span class="badge b-warn">STORM</span>';
  return'<span class="badge b-err">FAULT '+f.fault+"</span>";}
-function renderDash(){const g=$("fangrid");const fans=J.fans||[];
+function renderDash(){const g=$("fangrid");const fans=(J.fans||[]).filter(f=>f.present!==false);
  $("nofans").style.display=fans.length?"none":"";
  const key=fans.map(f=>f.index+":"+f.name+":"+f.fault+":"+f.validated).join("|");
  if(g.dataset.key!==key){g.dataset.key=key;g.innerHTML="";
@@ -153,8 +153,11 @@ function renderSys(){const fmt=s=>{const d=Math.floor(s/86400),h=Math.floor(s%86
   .map(([k,v])=>`<b>${k}</b><span>${v}</span>`).join("");
  $("srbtn").style.display=J.safe_mode?"":"none";
  $("otastate").textContent=J.ota_pending?"PENDING_VERIFY — wird nach 90 s gesundem Lauf validiert":"Image validiert";}
-function renderCfg(){const l=$("fanlist");l.innerHTML="";(J.fans||[]).forEach(f=>{const d=document.createElement("div");
-  d.innerHTML=`<span>${String(f.index+1).padStart(2,"0")} ${esc(f.name)} <span class="muted small">pwm${f.pwmPin} tach${f.tachPin}</span></span>`;
+function renderCfg(){const l=$("fanlist");l.innerHTML="";const fans=J.fans||[];
+ if(!fans.length)l.innerHTML='<div class="muted small">Noch keine Lüfter — unten anlegen.</div>';
+ fans.forEach(f=>{const d=document.createElement("div");
+  const pins=f.present===false?'<span class="muted small">unkonfiguriert</span>':`<span class="muted small">pwm${f.pwmPin} tach${f.tachPin}</span>`;
+  d.innerHTML=`<span>${String(f.index+1).padStart(2,"0")} ${esc(f.name)} ${pins}</span>`;
   const b=document.createElement("button");b.className="btn";b.style.margin="0";b.textContent="edit";
   b.onclick=()=>editFan(f.index);d.appendChild(b);
   l.appendChild(d);});
@@ -193,7 +196,7 @@ function watchReboot(){const b0=J?J.boot_count:0,t0=Date.now();
   if(j.boot_count!==b0){clearInterval(iv);$("fwst").textContent="Online: Boot#"+j.boot_count+
    (j.ota_pending?" — Health-Window läuft (90 s)":"");$("fwbtn").disabled=false;}})
   .catch(()=>{if(Date.now()-t0>120000){clearInterval(iv);$("fwst").textContent="Gerät meldet sich nicht.";}});},1500);}
-function poll(force){fetch("/api/status",{cache:"no-store"}).then(r=>r.json()).then(j=>{
+function poll(force){return fetch("/api/status",{cache:"no-store"}).then(r=>r.json()).then(j=>{
   J=j;fail=0;$("l-eth").classList.add("on");
   $("l-mqtt").classList.toggle("on",!!j.mqtt_connected);$("l-wdt").classList.toggle("on",!!j.wdt);
   $("dev").textContent=j.device||"—";$("l-ip").textContent=j.ip||"";
