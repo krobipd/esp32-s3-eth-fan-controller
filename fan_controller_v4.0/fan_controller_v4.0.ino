@@ -20,6 +20,8 @@ struct ApplyJob;
 #include <PubSubClient.h>
 #include <Preferences.h>
 
+#include "fw_util.h"
+
 #include "esp_wifi.h"
 #include "esp_bt.h"
 #include "esp_system.h"
@@ -376,8 +378,7 @@ PubSubClient   mqtt(ethClient);
 static String topicDev() { return String(mqttConfig.prefix) + "/" + deviceId; }
 static String topicFan(uint8_t i) { return topicDev() + "/fan/" + sanitizeName(fans[i].name); }
 
-static inline uint8_t pctFromDuty(uint8_t duty) { return (uint8_t)((duty * 100U + 127) / 255U); }
-static inline uint8_t dutyFromPct(uint8_t pct)  { pct = (uint8_t)constrain(pct, 0, 100); return (uint8_t)((pct * 255U + 50) / 100U); }
+// pctFromDuty/dutyFromPct kommen aus fw_util.h (host-getestet)
 
 // Vorab-Prototypen
 static void mqttPublishPWM(uint8_t i);
