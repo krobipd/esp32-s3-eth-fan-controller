@@ -26,11 +26,20 @@ struct ApplyJob;
 #include "esp_bt.h"
 #include "esp_system.h"
 #include "esp_task_wdt.h"
+#include "esp_ota_ops.h"
 
 extern "C" {
 #include "driver/pcnt.h"
 #include "esp_idf_version.h"
 }
+
+// [Spec §3.2] Boot-Auto-Validierung aufschieben: WIR markieren das Image erst
+// nach gesundem Lauf-Fenster als gueltig. Crash/WDT vorher => Bootloader-Rollback.
+// (Definition NACH allen Includes — Arduino-Autoproto, siehe CLAUDE.md §4.)
+extern "C" bool verifyRollbackLater() { return true; }
+
+static bool g_otaPendingVerify = false;
+static const uint32_t OTA_HEALTH_MS = 90000;
 
 // ==== Board-Pins (Waveshare ESP32-S3-ETH, W5500) ====
 #define ETH_MISO 12
@@ -1349,6 +1358,17 @@ static void sendJsonStatus(EthernetClient &c) {
   c.print(F("]}"));
 }
 
+// Geordneter Abgang vor jedem Restart: ioBroker sieht sofort "offline",
+// Log-Tail landet im NVS (zusaetzlich zum Shutdown-Handler).
+static void prepareRestart() {
+  if (mqtt.connected()) {
+    String t = topicDev() + "/status";
+    mqtt.publish(t.c_str(), "offline", true);
+    mqtt.disconnect();
+  }
+  persistLogTail();
+}
+
 // ==== OTA ====
 static bool handleOTA(EthernetClient &c, size_t contentLength) {
   if (contentLength == 0) {
@@ -1402,7 +1422,7 @@ static bool handleOTA(EthernetClient &c, size_t contentLength) {
   LOGI("OTA", "OK -> reboot");
   httpSendHeaderOK(c, "application/json; charset=UTF-8");
   c.print(F("{\"ok\":true,\"message\":\"Firmware erfolgreich aktualisiert\",\"reboot\":true,\"reboot_in\":5}"));
-  c.flush(); delay(300); ESP.restart();
+  c.flush(); prepareRestart(); delay(300); ESP.restart();
   return true;
 }
 
@@ -1535,7 +1555,7 @@ static void handleClient(EthernetClient &c) {
     }
     if (path == "/reboot") {
       httpSendHeaderOK(c, "text/plain; charset=UTF-8");
-      c.print(F("Rebooting...")); c.flush(); delay(200); ESP.restart(); return;
+      c.print(F("Rebooting...")); c.flush(); prepareRestart(); delay(200); ESP.restart(); return;
     }
     if (path == "/fans/set") {
       long idx = -1, duty = -1;
@@ -1620,6 +1640,16 @@ void setup() {
   }
   enableLoopWDT();
 
+  {
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    esp_ota_img_states_t st;
+    if (esp_ota_get_state_partition(running, &st) == ESP_OK &&
+        st == ESP_OTA_IMG_PENDING_VERIFY) {
+      g_otaPendingVerify = true;
+      LOGW("OTA", "Image PENDING_VERIFY - Health-Window 90s laeuft");
+    }
+  }
+
   loadPrevLogTail();
   bootTrackInit();
 
@@ -1672,6 +1702,13 @@ void setup() {
 void loop() {
   static uint32_t lastMeasureTick = 0;
   const uint32_t now = millis();
+
+  // [Spec §3.2] Health-Window: 90s gesund gelaufen => Image valid, Rollback abgewaehlt.
+  if (g_otaPendingVerify && now > OTA_HEALTH_MS) {
+    g_otaPendingVerify = false;
+    esp_ota_mark_app_valid_cancel_rollback();
+    LOGI("OTA", "Image nach 90s als VALID markiert");
+  }
 
   uint32_t hf = ESP.getFreeHeap();
   if (hf < g_minFreeHeap) g_minFreeHeap = hf;
