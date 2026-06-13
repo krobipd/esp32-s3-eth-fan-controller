@@ -57,8 +57,8 @@ static const uint32_t MQTT_PUB_MS_KEEPALIVE = 60000;
 static const uint16_t MQTT_RPM_ABS_DELTA    = 50;
 
 // HTTP & Buffers
-static const unsigned long CLIENT_RD_TIMEOUT = 15000;
-static const unsigned long BODY_RD_TIMEOUT   = 300000;
+static const unsigned long CLIENT_RD_TIMEOUT = 3000;   // Stall-Budget pro Zeile (< WDT 8s)
+static const unsigned long BODY_RD_TIMEOUT   = 30000;  // Stall-Budget Body/OTA (t0 reset bei Fortschritt)
 static const size_t        LOG_MAX           = 8192;
 static const uint32_t      LOG_FLUSH_MS      = 8000;
 static const size_t        LOG_NVS_MAX       = 1600;
@@ -970,6 +970,7 @@ static bool readLine(EthernetClient &c, String &out, unsigned long timeoutMs) {
       out += ch;
       if (out.length() > 4096) return true;
     }
+    feedLoopWDT();
     delay(1);
   }
   return (out.length() > 0);
@@ -1000,7 +1001,7 @@ static bool handleBodyToString(EthernetClient &c, size_t contentLength, String &
   out.reserve(contentLength + 8);
   size_t got = 0;
   unsigned long t0 = millis();
-  while (got < contentLength && millis() - t0 < BODY_RD_TIMEOUT) {
+  while (got < contentLength && !elapsed(millis(), t0, BODY_RD_TIMEOUT)) {
     int n = c.available();
     if (n > 0) {
       uint8_t b[256];
@@ -1010,7 +1011,7 @@ static bool handleBodyToString(EthernetClient &c, size_t contentLength, String &
         out.concat((const char*)b);
         got += rd; t0 = millis();
       }
-    } else delay(1);
+    } else { feedLoopWDT(); delay(1); }
   }
   return (got == contentLength);
 }
@@ -1367,9 +1368,10 @@ static bool handleOTA(EthernetClient &c, size_t contentLength) {
   unsigned long t0 = millis();
   int lastPct = -1;
   LOGI("OTA", String("start, size=") + contentLength + " bytes");
-  while (received < contentLength && millis() - t0 < BODY_RD_TIMEOUT) {
+  while (received < contentLength && !elapsed(millis(), t0, BODY_RD_TIMEOUT)) {
     int n = c.read(buf, min((int)BUFSZ, (int)(contentLength - received)));
     if (n > 0) {
+      feedLoopWDT();
       size_t w = Update.write(buf, n);
       if (w != (size_t)n) {
         httpSendHeaderOK(c, "application/json; charset=UTF-8");
@@ -1381,7 +1383,7 @@ static bool handleOTA(EthernetClient &c, size_t contentLength) {
       received += n; t0 = millis();
       int pct = (int)((received * 100UL) / contentLength);
       if (pct != lastPct && (pct % 5 == 0 || pct >= 99)) { LOGI("OTA", String("progress ") + pct + "%"); lastPct = pct; }
-    } else delay(1);
+    } else { feedLoopWDT(); delay(1); }
   }
   if (received != contentLength) {
     httpSendHeaderOK(c, "application/json; charset=UTF-8");
@@ -1606,7 +1608,16 @@ void setup() {
   delay(200);
   Serial.println(F("== ESP32-S3-ETH Fan Controller v4.0 =="));
 
-  esp_task_wdt_deinit();
+  // Anti-Brick: Task-WDT bleibt AKTIV und ueberwacht den Loop-Task.
+  // 8 s Budget; Panic => Reboot => ggf. Bootloader-Rollback (Spec §3.1/3.2).
+  {
+    esp_task_wdt_config_t wcfg = {};
+    wcfg.timeout_ms     = 8000;
+    wcfg.idle_core_mask = (1 << 0);
+    wcfg.trigger_panic  = true;
+    esp_task_wdt_reconfigure(&wcfg);
+  }
+  enableLoopWDT();
 
   loadPrevLogTail();
   bootTrackInit();
@@ -1616,6 +1627,7 @@ void setup() {
 
   loadConfigFans();
   loadMQTTConfig();
+  mqtt.setSocketTimeout(3);  // CONNACK-Busy-Wait < WDT-Budget (Spec §3.1)
   buildMacAndDeviceId();
   dutyPendingInit();
 
@@ -1634,7 +1646,7 @@ void setup() {
   // [B7] W5500 Ethernet — resetW5500() macht SPI.begin + Ethernet.init
   resetW5500();
 
-  if (Ethernet.begin(g_mac)) {
+  if (Ethernet.begin(g_mac, 4000, 1200)) {
     ethHasIP = true;
     httpServer.begin();
     httpUp = true;
@@ -1674,7 +1686,7 @@ void loop() {
   if (!ethHasIP) {
     if (Ethernet.linkStatus() == LinkON && (now - lastDhcpTryMs) > DHCP_RETRY_MS) {
       lastDhcpTryMs = now;
-      if (Ethernet.begin(g_mac)) {
+      if (Ethernet.begin(g_mac, 4000, 1200)) {
         ethHasIP = true;
         if (!httpUp) { httpServer.begin(); httpUp = true; }
         LOGI("NET", String("IP: ") + Ethernet.localIP().toString());
@@ -1706,7 +1718,7 @@ void loop() {
     EthernetClient c = httpServer.available();
     if (c) {
       unsigned long t0 = now;
-      while (c.connected() && !c.available() && (millis() - t0 < 400)) delay(1);
+      while (c.connected() && !c.available() && !elapsed(millis(), t0, 400)) { feedLoopWDT(); delay(1); }
       if (!c.available()) c.stop();
       else { handleClient(c); delay(1); c.stop(); }
     }
