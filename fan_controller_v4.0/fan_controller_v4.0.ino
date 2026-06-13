@@ -386,12 +386,13 @@ PubSubClient   mqtt(ethClient);
 
 // ==== MQTT Helpers ====
 static String topicDev() { return String(mqttConfig.prefix) + "/" + deviceId; }
-static String topicFan(uint8_t i) { return topicDev() + "/fan/" + sanitizeName(fans[i].name); }
+// Flaches Schema (Spec §4): <prefix>/<deviceId>/<name>/{speed,set,rpm}
+static String topicFan(uint8_t i) { return topicDev() + "/" + sanitizeName(fans[i].name); }
 
 // pctFromDuty/dutyFromPct kommen aus fw_util.h (host-getestet)
 
 // Vorab-Prototypen
-static void mqttPublishPWM(uint8_t i);
+static void mqttPublishSpeed(uint8_t i);
 static void mqttPublishRPM(uint8_t i, bool force = false);
 
 // ==== Safety: alle PWM-Pins LOW ====
@@ -540,7 +541,7 @@ static void fanSetDuty(Fan &f, uint8_t duty) {
 static void onDutyChanged(uint8_t idx) {
   if (idx >= MAX_FANS || !fanPresentIdx(idx)) return;
   stateScheduleDutySave(idx, fans[idx].duty);
-  mqttPublishPWM(idx);
+  mqttPublishSpeed(idx);
 }
 
 // ==== ISR (Glitchfilter) ====
@@ -749,10 +750,10 @@ static void dutyProcessQueue() {
 // ==== MQTT Publish/Subscribe ====
 static uint16_t g_lastRpmSent[MAX_FANS] = {0};
 
-static void mqttPublishPWM(uint8_t i) {
+static void mqttPublishSpeed(uint8_t i) {
   if (!mqtt.connected() || !fanPresentIdx(i)) return;
   char b[4]; snprintf(b, sizeof(b), "%u", (unsigned)pctFromDuty(fans[i].duty));
-  String t = topicFan(i) + "/pct";
+  String t = topicFan(i) + "/speed";
   mqtt.publish(t.c_str(), b, true);
 }
 
@@ -777,19 +778,15 @@ static void mqttPublishRPM(uint8_t i, bool force) {
 
 static void mqttCallback(char *topic, byte *payload, unsigned int length) {
   String t(topic);
-  if (!t.endsWith(F("/set"))) return;
+  String pre = topicDev() + "/";
+  if (!t.startsWith(pre) || !t.endsWith(F("/set"))) return;
+  String fanKey = t.substring(pre.length(), t.length() - 4);  // ".../<name>/set"
 
   char buf[8];
   unsigned int n = min(length, (unsigned)sizeof(buf) - 1), j = 0;
   for (unsigned int i = 0; i < n; i++) if (payload[i] >= 32) buf[j++] = (char)payload[i];
   buf[j] = 0;
   int pct = constrain(atoi(buf), 0, 100);
-
-  String pre = topicDev() + "/fan/";
-  if (!t.startsWith(pre)) return;
-  int p = t.indexOf(F("/set"), pre.length());
-  if (p < 0) return;
-  String fanKey = t.substring(pre.length(), p);
 
   for (uint8_t i = 0; i < MAX_FANS; i++) {
     if (!fanPresentIdx(i)) continue;
@@ -818,7 +815,7 @@ static void mqttEnsureConnected() {
       for (uint8_t i = 0; i < MAX_FANS; i++) {
         if (!fanPresentIdx(i)) continue;
         mqtt.subscribe((topicFan(i) + "/set").c_str());
-        mqttPublishPWM(i);
+        mqttPublishSpeed(i);
       }
       mqttWasConnected = true;
       g_mqttBackoffMs = 3000;
@@ -862,8 +859,8 @@ static void applyDo(uint8_t idx) {
     detachFanCounters(idx);
 
     if (mqtt.connected() && f.name[0]) {
-      String baseOld = String(mqttConfig.prefix) + "/" + deviceId + "/fan/" + sanitizeName(String(f.name));
-      mqtt.publish((baseOld + "/pct").c_str(), "", true);
+      String baseOld = String(mqttConfig.prefix) + "/" + deviceId + "/" + sanitizeName(String(f.name));
+      mqtt.publish((baseOld + "/speed").c_str(), "", true);
       mqtt.unsubscribe((baseOld + "/set").c_str());
     }
 
@@ -882,12 +879,12 @@ static void applyDo(uint8_t idx) {
   // Name change
   if (j.nameChanged) {
     if (mqtt.connected()) {
-      String oldBase = String(mqttConfig.prefix) + "/" + deviceId + "/fan/" + sanitizeName(String(f.name));
-      mqtt.publish((oldBase + "/pct").c_str(), "", true);
+      String oldBase = String(mqttConfig.prefix) + "/" + deviceId + "/" + sanitizeName(String(f.name));
+      mqtt.publish((oldBase + "/speed").c_str(), "", true);
       mqtt.unsubscribe((oldBase + "/set").c_str());
       safeStrcpy(f.name, sizeof(f.name), String(j.name));
       mqtt.subscribe((topicFan(idx) + "/set").c_str());
-      mqttPublishPWM(idx);
+      mqttPublishSpeed(idx);
     } else {
       safeStrcpy(f.name, sizeof(f.name), String(j.name));
     }
