@@ -43,6 +43,17 @@ Alle Punkte referenzieren das Code-Audit (CLAUDE.md §6 Pkt. 8–17, §12C, §12
   erreicht den 90-s-Punkt), ruft es `esp_ota_mark_app_valid_cancel_rollback()`.
   Bewusst **nicht** an Link/MQTT geknüpft — ein Broker-/Switch-Ausfall darf kein
   gutes Image zurückrollen.
+- **`commitIfPending()` (Review-Fund 2, 13.06.):** Markiert das Image auch dann VALID,
+  wenn es **bewusst neu gestartet** wird, bevor die 90 s um sind — d.h. am Anfang von
+  `handleOTA` (vor `Update.begin`/`set_boot_partition`) und in `prepareRestart`/`apiReboot`.
+  Begründung: ein Image, das gerade einen HTTP-/OTA-Request bedient, hat seine
+  Lauffähigkeit bewiesen. **Schwächt den Anti-Brick-Schutz NICHT:** ein Image, das nicht
+  bootet oder hängt, erreicht diese Pfade nie (bleibt `PENDING_VERIFY` ⇒ Rollback). Die
+  Voraussetzung ist, dass der **Safe-Mode HTTP+OTA am Leben hält** (§3.7) — würde der
+  je abgeschaltet, wäre dieser Early-Commit gefährlich.
+- **Restrisiko (dokumentiert, nicht behebbar in Stufe 1):** ein *unkommandierter*
+  Reset im 90-s-Fenster (PoE-/Power-Blip, Brownout) rollt zurück. ⇒ Checklist §6:
+  „im ersten ~90 s nach Flash NICHT stromlos machen/power-cyclen".
 - Crash/Hänger vor Ablauf ⇒ WDT-Reboot ⇒ Bootloader-Rollback aufs vorherige Image
   (Mechanik §12C, Core 3.3.8 verifiziert).
 

@@ -395,6 +395,15 @@ HTTP → MQTT → Storm-Recovery → RPM-Messung → Persistenz. `delay(2)` am E
     ```
   - Bestätigt: **ohne irgendeinen Override wird ein Image automatisch valid** (weil
     `verifyOta()` default `true`) → das ist „notwendig ≠ hinreichend" aus §11.
+  - 🔑 **v4.0-Umsetzung (13.06., NICHT „wegreparieren"!):** Das 90-s-Health-Fenster ist
+    NICHT die einzige Stelle, die valid markiert. `commitIfPending()` markiert das Image
+    ebenfalls bei einem **bewussten Reboot/OTA aus dem laufenden Image** (Anfang
+    `handleOTA` vor `Update.begin`, sowie `prepareRestart`/`apiReboot`). Grund: sonst rollt
+    ein Reboot/zweites OTA *innerhalb* der 90 s auf die alte FW zurück, und ein OTA im
+    Fenster ruft `set_boot_partition()` aus `PENDING_VERIFY` heraus (unklare Ecke). Das ist
+    sicher, weil ein nicht-bootendes/hängendes Image diese Pfade nie erreicht — **solange
+    der Safe-Mode HTTP+OTA am Leben hält** (§6/Spec §3.7). Restrisiko: unkommandierter
+    Power-Blip/Brownout im 90-s-Fenster rollt zurück (in Flash-Checkliste dokumentiert).
 - 🟡 `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE` ist Bootloader-Compile-Zeit-Option (PlatformIO
   `build_flags` wirken nicht) — für uns irrelevant: Arduino-Core-Bootloader hat es schon.
 
