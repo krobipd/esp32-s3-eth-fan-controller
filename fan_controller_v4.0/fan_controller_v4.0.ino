@@ -294,7 +294,8 @@ struct Fan {
   bool     validated;
   FanFault fault;
   uint8_t  faultCount;
-  uint32_t stormUntilMs;
+  uint32_t stormSinceMs;
+  bool     stormActive;
 
   uint8_t  burstLeft;
   bool     measureSuspended;
@@ -313,7 +314,7 @@ static void fanInitDefaults(uint8_t idx) {
   f.lastRpmPubMs = 0;
   f.pcntEnabled = false; f.pcntUnit = PCNT_UNIT_0;
   f.validated = false; f.fault = FF_OK; f.faultCount = 0;
-  f.stormUntilMs = 0; f.burstLeft = 0; f.measureSuspended = false;
+  f.stormSinceMs = 0; f.stormActive = false; f.burstLeft = 0; f.measureSuspended = false;
   f.lastEdgeUs = 0;
   uint32_t minPulse = (uint32_t)((60UL * 1000000UL) / max<uint32_t>(1, (uint32_t)MAX_EXPECTED_RPM * PULSES_PER_REV));
   f.minPulseUs = max<uint32_t>(MIN_PULSE_US_FLOOR, minPulse / 3);
@@ -660,7 +661,8 @@ static inline void stormTrip(uint8_t i) {
   fanMarkFault(i, FF_PULSE_STORM);
   f.measureSuspended = true;
   detachFanCounters(i);
-  f.stormUntilMs = millis() + STORM_COOLDOWN_MS;
+  f.stormActive = true;
+  f.stormSinceMs = millis();
   f.rpmRawA = f.rpmRawB = f.rpmRawC = 0;
   f.rpmEma  = 0;
   f.rpmShown = 0;
@@ -668,10 +670,10 @@ static inline void stormTrip(uint8_t i) {
 }
 static inline void stormTryRecover(uint8_t i) {
   Fan &f = fans[i];
-  if (f.stormUntilMs == 0) return;
-  if (millis() < f.stormUntilMs) return;
+  if (!f.stormActive) return;
+  if (!elapsed(millis(), f.stormSinceMs, STORM_COOLDOWN_MS)) return;
 
-  f.stormUntilMs = 0;
+  f.stormActive = false;
   f.measureSuspended = true;
   detachFanCounters(i);
   rebuildPcntMap();
@@ -792,7 +794,8 @@ static void mqttCallback(char *topic, byte *payload, unsigned int length) {
 
 static bool ethHasIP = false, httpUp = false;
 static bool mqttWasConnected = false;
-static uint32_t g_nextMqttTryMs = 0, g_mqttBackoffMs = 3000;
+static uint32_t g_lastMqttTryMs = 0;
+static uint32_t g_mqttBackoffMs = 3000;
 
 static void mqttEnsureConnected() {
   if (!mqttConfig.enabled || strlen(mqttConfig.host) == 0 || !ethHasIP) { mqttWasConnected = false; return; }
@@ -809,13 +812,14 @@ static void mqttEnsureConnected() {
       }
       mqttWasConnected = true;
       g_mqttBackoffMs = 3000;
-      g_nextMqttTryMs = now + g_mqttBackoffMs;
+      g_lastMqttTryMs = now;
       LOGI("MQTT", "connected");
     }
     return;
   }
 
-  if (now < g_nextMqttTryMs) return;
+  if (!elapsed(now, g_lastMqttTryMs, g_mqttBackoffMs)) return;
+  g_lastMqttTryMs = now;
 
   mqtt.setServer(mqttConfig.host, mqttConfig.port);
   mqtt.setCallback(mqttCallback);
@@ -830,7 +834,6 @@ static void mqttEnsureConnected() {
   } else {
     LOGW("MQTT", String("connect failed, state=") + mqtt.state());
     g_mqttBackoffMs = min<uint32_t>(g_mqttBackoffMs * 2, 60000);
-    g_nextMqttTryMs = now + g_mqttBackoffMs;
   }
 }
 
@@ -958,8 +961,8 @@ static void httpSendRedirect(EthernetClient &c, const char *loc) {
 
 static bool readLine(EthernetClient &c, String &out, unsigned long timeoutMs) {
   out = "";
-  unsigned long dl = millis() + timeoutMs;
-  while (millis() < dl) {
+  unsigned long t0 = millis();
+  while (!elapsed(millis(), t0, timeoutMs)) {
     while (c.available()) {
       char ch = (char)c.read();
       if (ch == '\r') continue;
@@ -1734,7 +1737,7 @@ void loop() {
       if (!fanPresentIdx(i)) continue;
       Fan &f = fans[i];
 
-      if (f.stormUntilMs && now < f.stormUntilMs) {
+      if (f.stormActive) {
         f.rpmRawA = f.rpmRawB = f.rpmRawC = 0;
         if (f.rpmEma > 0.01f) f.rpmEma *= (1.0f - EMA_ALPHA);
         else f.rpmEma = 0;
