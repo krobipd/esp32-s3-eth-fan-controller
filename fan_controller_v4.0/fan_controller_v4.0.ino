@@ -72,6 +72,7 @@ static const uint16_t MQTT_RPM_ABS_DELTA    = 50;
 // HTTP & Buffers
 static const unsigned long CLIENT_RD_TIMEOUT = 3000;   // Stall-Budget pro Zeile (< WDT 8s)
 static const unsigned long BODY_RD_TIMEOUT   = 30000;  // Stall-Budget Body/OTA (t0 reset bei Fortschritt)
+static const unsigned long HTTP_REQ_BUDGET_MS = 10000; // Gesamtbudget Nicht-OTA-Request (Spec §3.1)
 static const size_t        LOG_MAX           = 8192;
 static const uint32_t      LOG_FLUSH_MS      = 600000;  // 10 min — NVS-Wear (Spec §3.5)
 static const size_t        LOG_NVS_MAX       = 1600;
@@ -782,8 +783,15 @@ static void mqttCallback(char *topic, byte *payload, unsigned int length) {
 
   char buf[8];
   unsigned int n = min(length, (unsigned)sizeof(buf) - 1), j = 0;
-  for (unsigned int i = 0; i < n; i++) if (payload[i] >= 32) buf[j++] = (char)payload[i];
+  bool hasDigit = false;
+  for (unsigned int i = 0; i < n; i++) {
+    if (payload[i] >= 32) buf[j++] = (char)payload[i];
+    if (payload[i] >= '0' && payload[i] <= '9') hasDigit = true;
+  }
   buf[j] = 0;
+  // [Review-Fund E] Leere/ziffernlose Payload ignorieren statt versehentlich auf 0% zu fahren
+  // (schuetzt gegen Fehl-Publishes und geleerte retained Topics).
+  if (!hasDigit) { LOGW("MQTT", "set ohne Zahl ignoriert"); return; }
   int pct = constrain(atoi(buf), 0, 100);
 
   for (uint8_t i = 0; i < MAX_FANS; i++) {
@@ -994,10 +1002,13 @@ static void apiErr(EthernetClient &c, const char *msg) {  // nur statische msg!
   c.print(F("{\"ok\":false,\"error\":\"")); c.print(msg); c.print(F("\"}"));
 }
 
+// Gesamtbudget des aktuellen Nicht-OTA-Requests (Spec §3.1). In handleClient gesetzt.
+static uint32_t g_reqStart = 0;
+
 static bool readLine(EthernetClient &c, String &out, unsigned long timeoutMs) {
   out = "";
   unsigned long t0 = millis();
-  while (!elapsed(millis(), t0, timeoutMs)) {
+  while (!elapsed(millis(), t0, timeoutMs) && !elapsed(millis(), g_reqStart, HTTP_REQ_BUDGET_MS)) {
     while (c.available()) {
       char ch = (char)c.read();
       if (ch == '\r') continue;
@@ -1040,7 +1051,9 @@ static bool handleBodyToString(EthernetClient &c, size_t contentLength, String &
   out.reserve(contentLength + 8);
   size_t got = 0;
   unsigned long t0 = millis();
-  while (got < contentLength && !elapsed(millis(), t0, BODY_RD_TIMEOUT)) {
+  // Form-Bodies sind auf 4 KB gecappt; zusaetzlich das 10s-Gesamtbudget (Spec §3.1).
+  while (got < contentLength && !elapsed(millis(), t0, BODY_RD_TIMEOUT)
+         && !elapsed(millis(), g_reqStart, HTTP_REQ_BUDGET_MS)) {
     int n = c.available();
     if (n > 0) {
       uint8_t b[256];
@@ -1140,6 +1153,7 @@ static void sendJsonStatus(EthernetClient &c) {
     c.print(F(",\"tachPin\":")); c.print(fans[i].tachPin);
     c.print(F(",\"fault\":")); c.print((int)fans[i].fault);
     c.print(F(",\"validated\":")); c.print(fans[i].validated ? "true" : "false");
+    c.print(F(",\"inv\":")); c.print(fans[i].invertPwm ? "true" : "false");
     c.print(F(",\"cmin\":")); c.print((int)pctFromDuty(fans[i].calMinStart));
     c.print(F(",\"cnote\":")); jsonPrintEscaped(c, fans[i].calNote);
     c.print(F("}"));
@@ -1147,9 +1161,23 @@ static void sendJsonStatus(EthernetClient &c) {
   c.print(F("]}"));
 }
 
+// [Spec §3.2 / Review-Fund 2] Ein Image, das HTTP/OTA bedient, hat seine Lauffaehigkeit
+// bewiesen -> als gueltig markieren, damit ein Reboot/zweites OTA INNERHALB des 90s-
+// Health-Windows NICHT auf die alte FW zurueckrollt. Schwaecht den Anti-Brick-Schutz
+// NICHT: ein Image, das nicht bootet/haengt, erreicht diesen Pfad nie (bleibt PENDING
+// -> Rollback). Voraussetzung bleibt, dass der Safe-Mode HTTP+OTA am Leben haelt.
+static void commitIfPending() {
+  if (g_otaPendingVerify) {
+    esp_ota_mark_app_valid_cancel_rollback();
+    g_otaPendingVerify = false;
+    LOGI("OTA", "Image als VALID markiert (bewusster Reboot/OTA aus laufendem Image)");
+  }
+}
+
 // Geordneter Abgang vor jedem Restart: ioBroker sieht sofort "offline",
 // Log-Tail landet im NVS (zusaetzlich zum Shutdown-Handler).
 static void prepareRestart() {
+  commitIfPending();
   if (mqtt.connected()) {
     String t = topicDev() + "/status";
     mqtt.publish(t.c_str(), "offline", true);
@@ -1160,6 +1188,10 @@ static void prepareRestart() {
 
 // ==== OTA ====
 static bool handleOTA(EthernetClient &c, size_t contentLength) {
+  // [Review-Fund 2] Laufendes Image zuerst gueltig markieren: es bedient gerade einen
+  // OTA-Upload, ist also gesund. Sonst ruft Update.end()->set_boot_partition() aus einem
+  // noch PENDING_VERIFY-Zustand (unklare Rollback-Ecke beim OTA INNERHALB des Health-Windows).
+  commitIfPending();
   if (contentLength == 0) {
     httpSendHeaderOK(c, "application/json; charset=UTF-8");
     c.print(F("{\"ok\":false,\"error\":\"No Content or chunked unsupported\"}"));
@@ -1345,6 +1377,7 @@ static void apiReboot(EthernetClient &c, const String &body) {
 
 // ==== Router ====
 static void handleClient(EthernetClient &c) {
+  g_reqStart = millis();  // [Spec §3.1] 10s-Gesamtbudget ab erster Zeile (OTA-Body liest direkt via c.read())
   String rl;
   if (!readLine(c, rl, CLIENT_RD_TIMEOUT)) return;
   String method = rl.substring(0, rl.indexOf(' '));
@@ -1486,7 +1519,11 @@ void setup() {
   dutyProcessQueue();
 
   // [B7] W5500 Ethernet — resetW5500() macht SPI.begin + Ethernet.init
+  // [Review-Fund D] WDT um die langsamen Schritte (W5500-Reset ~250ms, DHCP bis 4s)
+  // explizit fuettern: enableLoopWDT() ist aktiv, setup() laeuft im Loop-Task (8s-Budget).
+  feedLoopWDT();
   resetW5500();
+  feedLoopWDT();
 
   if (Ethernet.begin(g_mac, 4000, 1200)) {
     ethHasIP = true;
@@ -1506,12 +1543,9 @@ void loop() {
   static uint32_t lastMeasureTick = 0;
   const uint32_t now = millis();
 
-  // [Spec §3.2] Health-Window: 90s gesund gelaufen => Image valid, Rollback abgewaehlt.
-  if (g_otaPendingVerify && now > OTA_HEALTH_MS) {
-    g_otaPendingVerify = false;
-    esp_ota_mark_app_valid_cancel_rollback();
-    LOGI("OTA", "Image nach 90s als VALID markiert");
-  }
+  // [Spec §3.2] Health-Window: 90s am Stueck gesund gelaufen => Image valid, Rollback abgewaehlt.
+  // (Ein bewusster Reboot/OTA innerhalb der 90s markiert ebenfalls valid, siehe commitIfPending.)
+  if (g_otaPendingVerify && now > OTA_HEALTH_MS) commitIfPending();
 
   uint32_t hf = ESP.getFreeHeap();
   if (hf < g_minFreeHeap) g_minFreeHeap = hf;

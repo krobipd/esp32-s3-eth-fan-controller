@@ -169,7 +169,7 @@ function pinOpts(sel,list,current){sel.innerHTML="";[...new Set([current,...list
 function editFan(i){editIdx=i;const f=(J.fans||[]).find(x=>x.index===i);if(!f)return;
  $("editbox").style.display="";$("e-idx").textContent=i;$("e-name").value=f.name;
  pinOpts($("e-pwm"),J.free_pwm||[],f.pwmPin);pinOpts($("e-tach"),J.free_tach||[],f.tachPin);
- $("e-inv").checked=false;$("e-cmin").value=f.cmin??0;$("e-note").value=f.cnote??"";}
+ $("e-inv").checked=!!f.inv;$("e-cmin").value=f.cmin??0;$("e-note").value=f.cnote??"";}
 function saveFan(){api("/api/fan/save",{idx:editIdx,name:$("e-name").value,pwm:$("e-pwm").value,
  tach:$("e-tach").value,inv:$("e-inv").checked?1:0},()=>{toast("Gespeichert");poll(true);});}
 function delFan(){if(confirm("Lüfter wirklich löschen?"))

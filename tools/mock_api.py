@@ -3,10 +3,10 @@
 import json, random, http.server
 
 FANS = [
-  {"index":0,"name":"mac","present":True,"pwm":133,"pct":52,"rpm":724,"pwmPin":40,"tachPin":37,"fault":0,"validated":True,"cmin":20,"cnote":"Noctua"},
-  {"index":1,"name":"unifi","present":True,"pwm":140,"pct":55,"rpm":811,"pwmPin":42,"tachPin":35,"fault":0,"validated":True,"cmin":0,"cnote":""},
-  {"index":2,"name":"usv","present":True,"pwm":128,"pct":50,"rpm":747,"pwmPin":41,"tachPin":36,"fault":3,"validated":True,"cmin":0,"cnote":""},
-  {"index":3,"name":"nas","present":True,"pwm":148,"pct":58,"rpm":858,"pwmPin":47,"tachPin":38,"fault":0,"validated":True,"cmin":15,"cnote":"be quiet"},
+  {"index":0,"name":"mac","present":True,"pwm":133,"pct":52,"rpm":724,"pwmPin":40,"tachPin":37,"fault":0,"validated":True,"inv":False,"cmin":20,"cnote":"Noctua"},
+  {"index":1,"name":"unifi","present":True,"pwm":140,"pct":55,"rpm":811,"pwmPin":42,"tachPin":35,"fault":0,"validated":True,"inv":False,"cmin":0,"cnote":""},
+  {"index":2,"name":"usv","present":True,"pwm":128,"pct":50,"rpm":747,"pwmPin":41,"tachPin":36,"fault":3,"validated":True,"inv":True,"cmin":0,"cnote":""},
+  {"index":3,"name":"nas","present":True,"pwm":148,"pct":58,"rpm":858,"pwmPin":47,"tachPin":38,"fault":0,"validated":True,"inv":False,"cmin":15,"cnote":"be quiet"},
 ]
 
 class H(http.server.BaseHTTPRequestHandler):
@@ -39,7 +39,7 @@ class H(http.server.BaseHTTPRequestHandler):
         if self.path == "/api/fan/new":
             idx = len(FANS)
             FANS.append({"index":idx,"name":"fan%d"%(idx+1),"present":False,"pwm":0,"pct":0,
-                         "rpm":0,"pwmPin":255,"tachPin":255,"fault":0,"validated":False,"cmin":0,"cnote":""})
+                         "rpm":0,"pwmPin":255,"tachPin":255,"fault":0,"validated":False,"inv":False,"cmin":0,"cnote":""})
             self._send(200, "application/json", '{"ok":true,"idx":%d}' % idx)
             return
         self._send(200, "application/json", '{"ok":true}')
