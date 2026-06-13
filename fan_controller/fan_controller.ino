@@ -1513,9 +1513,20 @@ void loop() {
   static uint32_t lastMeasureTick = 0;
   const uint32_t now = millis();
 
-  // [Spec §3.2] Health-Window: 90s am Stueck gesund gelaufen => Image valid, Rollback abgewaehlt.
-  // (Ein bewusster Reboot/OTA innerhalb der 90s markiert ebenfalls valid, siehe commitIfPending.)
-  if (g_otaPendingVerify && now > OTA_HEALTH_MS) commitIfPending();
+  // [Stufe2/1] Netz-gebundenes Health-Window (aus Stufe 3 vorgezogen, da Stufe 1 der
+  // Netz-Umbau ist): ein Image, das KEINE IP bekommt, darf sich NICHT gueltig markieren
+  // (sonst Soft-Brick: laeuft, aber unerreichbar). Bei "keine IP nach 120s" Selbst-Neustart
+  // OHNE commit => Bootloader rollt auf v4.0 zurueck.
+  if (g_otaPendingVerify) {
+    if (now > OTA_HEALTH_MS && ethHasIp()) {
+      commitIfPending();
+    } else if (now > 120000UL && !ethHasIp()) {
+      LOGE("OTA", "kein IP nach 120s -> Selbst-Neustart, Rollback auf v4.0");
+      persistLogTail();
+      delay(100);
+      esp_restart();   // ohne commit -> PENDING_VERIFY bleibt -> Bootloader-Rollback
+    }
+  }
 
   uint32_t hf = ESP.getFreeHeap();
   if (hf < g_minFreeHeap) g_minFreeHeap = hf;
