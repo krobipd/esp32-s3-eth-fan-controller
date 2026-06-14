@@ -21,6 +21,7 @@ struct ApplyJob;
 #include <Preferences.h>
 
 #include "fw_util.h"
+#include "concurrency.h"   // Stufe 3: Cross-Core-Queues (Telemetrie/Duty/...)
 #include "net_eth.h"   // nativer W5500-Treiber (ETH.h) + Link-Events; ersetzt Ethernet.h
 
 #include "esp_wifi.h"
@@ -548,7 +549,8 @@ static void fanSetDuty(Fan &f, uint8_t duty) {
 static void onDutyChanged(uint8_t idx) {
   if (idx >= MAX_FANS || !fanPresentIdx(idx)) return;
   stateScheduleDutySave(idx, fans[idx].duty);
-  mqttPublishSpeed(idx);
+  TelemetrySample s = { idx, TELEM_SPEED, fans[idx].duty, 0, (uint8_t)fans[idx].fault };  // §4.1: Control postet
+  telemPost(s);
 }
 
 // ==== ISR (Glitchfilter) ====
@@ -763,22 +765,39 @@ static void mqttPublishSpeed(uint8_t i) {
   mqtt.publish((topicFan(i) + "/speed").c_str(), b, 0, true);
 }
 
-static void mqttPublishRPM(uint8_t i, bool force) {
-  if (!mqtt.isConnected() || !fanPresentIdx(i)) return;
+// §4.1: RPM-Telemetrie posten statt direkt publishen. Throttle bleibt PRODUCER-seitig
+// (Keepalive/Delta) -> haelt die Queue leicht; der Netz-Task (telemDrain) published nur noch.
+// Throttle-State (lastRpmPubMs/g_lastRpmSent) gehoert dem Control-Core -> kein Cross-Core-Zugriff.
+static void telemPostRpm(uint8_t i) {
+  if (!fanPresentIdx(i)) return;
   uint32_t now = millis();
   uint16_t rpm = fans[i].rpmShown;
-  bool due = force;
-  if (!due) {
-    if (fans[i].lastRpmPubMs == 0) due = true;
-    else if (now - fans[i].lastRpmPubMs >= MQTT_PUB_MS_KEEPALIVE) due = true;
-    else if (abs((int)rpm - (int)g_lastRpmSent[i]) >= MQTT_RPM_ABS_DELTA) due = true;
-  }
+  bool due = (fans[i].lastRpmPubMs == 0)
+          || elapsed(now, fans[i].lastRpmPubMs, MQTT_PUB_MS_KEEPALIVE)
+          || abs((int)rpm - (int)g_lastRpmSent[i]) >= MQTT_RPM_ABS_DELTA;
   if (!due) return;
-
-  char b[12]; snprintf(b, sizeof(b), "%u", (unsigned)rpm);
-  mqtt.publish((topicFan(i) + "/rpm").c_str(), b, 0, false);
+  TelemetrySample s = { i, TELEM_RPM, fans[i].duty, rpm, (uint8_t)fans[i].fault };
+  telemPost(s);
   fans[i].lastRpmPubMs = now;
   g_lastRpmSent[i] = rpm;
+}
+
+// Telemetrie-Queue leeren und via esp-mqtt publishen. NUR aus dem Netz-Kontext aufrufen
+// (Task 8: networkTask). Liest fans[] nicht ausser topicFan (Name unter fansMutex).
+static void telemDrain() {
+  if (!g_telemQ) return;
+  TelemetrySample s;
+  while (xQueueReceive(g_telemQ, &s, 0) == pdTRUE) {
+    if (!mqtt.isConnected()) continue;          // Queue trotzdem leeren (kein Stau)
+    String base = topicFan(s.idx);
+    if (s.kind == TELEM_SPEED) {
+      char b[4]; snprintf(b, sizeof(b), "%u", (unsigned)pctFromDuty(s.duty));
+      mqtt.publish((base + "/speed").c_str(), b, 0, true);
+    } else {
+      char b[12]; snprintf(b, sizeof(b), "%u", (unsigned)s.rpm);
+      mqtt.publish((base + "/rpm").c_str(), b, 0, false);
+    }
+  }
 }
 
 // Befehl von <prefix>/<deviceId>/<fan>/set anwenden. idx ist im Subscribe-Lambda gebunden,
@@ -1455,7 +1474,9 @@ void setup() {
   delay(200);
   Serial.println(F("== ESP32-S3-ETH Fan Controller v4.0 =="));
 
-  // §4.3: fans[]-/Cleanup-Mutex VOR dem esp-mqtt-Task anlegen (loopStart() weiter unten).
+  // §4: Cross-Core-Queues + fans[]-/Cleanup-Mutex VOR allem anderen anlegen (esp-mqtt-Task
+  // startet erst mit loopStart() weiter unten; Log-Queue (spaeter) faengt ab hier alle LOGs).
+  concurrencyInit();
   fansMutex = xSemaphoreCreateMutex();
 
   // Anti-Brick: Task-WDT bleibt AKTIV und ueberwacht den Loop-Task.
@@ -1684,12 +1705,15 @@ void loop() {
 
       if (f.burstLeft > 0) f.burstLeft--;
 
-      mqttPublishRPM(i, false);
+      telemPostRpm(i);   // §4.1: Telemetrie in die Queue (Netz-Task published)
     }
   }
 
   // --- Duty-State persistieren ---
   stateFlushIfNeeded(now);
+
+  // --- Telemetrie -> MQTT (vorlaeufig im Loop; Task 8 verschiebt das in den networkTask) ---
+  telemDrain();
 
   // --- Log-Tail persistieren ---
   static uint32_t lastLogFlush = 0;
