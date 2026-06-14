@@ -329,7 +329,6 @@ static void clearFanNVS(uint8_t idx) {
   p.putUChar((k + "pwm").c_str(),  0xFF);
   p.putUChar((k + "tac").c_str(),  0xFF);
   p.putUChar((k + "inv").c_str(),  0);
-  p.putUChar((k + "duty").c_str(), 0);
   p.putUChar((k + "cmin").c_str(), 0);
   p.putString((k + "cnote").c_str(), "");
   p.putString((k + "name").c_str(), "");
@@ -816,6 +815,12 @@ static void applyDo(uint8_t idx) {
     }
 
     clearFanNVS(idx);
+    // Persistierten Duty im RICHTIGEN Namespace ("state") raeumen + RAM-Tracking nullen,
+    // sonst erbt ein neuer Luefter im selben Slot nach Reboot die alte Drehzahl.
+    { Preferences p; p.begin("state", false); p.remove((String("f") + idx + "_duty").c_str()); p.end(); }
+    g_pendingDuty[idx]   = -1;
+    g_lastSavedDuty[idx] = 0;
+    g_stateDirty[idx]    = false;
     memset(&f, 0, sizeof(Fan));
     f.pwmPin = 0xFF; f.tachPin = 0xFF;
     g_lastRpmSent[idx] = 0;
@@ -1221,10 +1226,11 @@ static void apiFanSave(NetworkClient &c, const String &body) {
 
   String newName = String(f.name);
   if (formGet(body, F("name"), s)) newName = s;
+  { String rt = newName; rt.trim(); if (rt.isEmpty()) { apiErr(c, "name required"); return; } }  // kein leerer Name (sonst sanitize->"fan"-Fallback = unsichtbarer Geist)
   String cleanName = sanitizeName(newName);
   if (!fanNameValid(cleanName.c_str())) { apiErr(c, "invalid name"); return; }
-  for (uint8_t i = 0; i < MAX_FANS; i++) {  // Topic-Kollision (Spec §4)
-    if ((int)i == idx || !fanPresentIdx(i)) continue;
+  for (uint8_t i = 0; i < MAX_FANS; i++) {  // Topic-Kollision (Spec §4): gegen ALLE belegten Slots, nicht nur present-e
+    if ((int)i == idx || fans[i].name[0] == 0) continue;
     if (sanitizeName(fans[i].name) == cleanName) { apiErr(c, "name in use"); return; }
   }
 
@@ -1236,9 +1242,12 @@ static void apiFanSave(NetworkClient &c, const String &body) {
   if (newPwm != f.pwmPin && !validPwmForFan(newPwm,  (int8_t)idx)) { apiErr(c, "pwm pin invalid/busy"); return; }
   if (newTac != f.tachPin && !validTachForFan(newTac, (int8_t)idx)) { apiErr(c, "tach pin invalid/busy"); return; }
   if (isNew && (newPwm == 0xFF || newTac == 0xFF)) { apiErr(c, "pins required"); return; }  // neuer Luefter braucht Pins
+  if (newPwm != 0xFF && newPwm == newTac) { apiErr(c, "pwm/tach pin gleich"); return; }     // ein GPIO kann nicht PWM UND Tacho
 
   ApplyJob j; j.idx = (uint8_t)idx;
-  if (sanitizeName(String(f.name)) != cleanName) { safeStrcpy(j.name, sizeof(j.name), cleanName); j.nameChanged = true; }
+  // isNew: Name IMMER schreiben — sonst bleibt bei cleanName=="fan" (leer/"Fan"/Sonderzeichen) nameChanged false
+  // und der Slot wuerde mit Pins, aber ohne Namen angelegt = unsichtbarer Geist (nicht present).
+  if (isNew || sanitizeName(String(f.name)) != cleanName) { safeStrcpy(j.name, sizeof(j.name), cleanName); j.nameChanged = true; }
   if (inv != f.invertPwm) { j.invert = inv; j.invChanged = true; }
   if (newPwm != f.pwmPin || newTac != f.tachPin) { j.pwmPin = newPwm; j.tachPin = newTac; j.pinsChanged = true; }
   if (j.nameChanged || j.invChanged || j.pinsChanged) applyQueue((uint8_t)idx, j);
