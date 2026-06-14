@@ -28,3 +28,27 @@ static inline bool fanNameValid(const char *s) {
   if (strcmp(s, "status") == 0 || strcmp(s, "sys") == 0) return false;
   return true;
 }
+
+// §18: RAM-only Pending-Cleanup-Liste fuer verwaiste retained MQTT-Topics.
+// Wird ein Luefter geloescht/umbenannt waehrend MQTT getrennt ist, laesst sich der alte
+// retained Topic (…/<name>/speed) nicht sofort raeumen -> sanitized Namen hier vormerken;
+// onMqttConnect raeumt sie nach (leere retained Payload + unsubscribe). RAM-only bewusst:
+// der reboot-vor-reconnect-Edge ist kosmetisch und rechtfertigt kein NVS (Wear-Historie).
+#define CLEANUP_MAX 8
+struct PendingCleanup {
+  char    names[CLEANUP_MAX][20];
+  uint8_t count;
+};
+// Sanitized Namen vormerken. Dedup; leerer Name abgelehnt; bei voller Liste verworfen
+// (Rueckgabe false = degradiert auf altes Verhalten fuer diesen einen Topic).
+static inline bool pendingCleanupAdd(PendingCleanup &pc, const char *name) {
+  if (!name || name[0] == 0) return false;
+  for (uint8_t i = 0; i < pc.count; i++)
+    if (strcmp(pc.names[i], name) == 0) return true;   // schon vorgemerkt -> ok
+  if (pc.count >= CLEANUP_MAX) return false;           // voll -> drop
+  size_t n = strlen(name); if (n > 19) n = 19;
+  memcpy(pc.names[pc.count], name, n); pc.names[pc.count][n] = 0;
+  pc.count++;
+  return true;
+}
+static inline void pendingCleanupClear(PendingCleanup &pc) { pc.count = 0; }

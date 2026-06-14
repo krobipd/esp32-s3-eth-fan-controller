@@ -370,6 +370,22 @@ static void fanAutoValidate(uint8_t idx) {
 // ==== Globaler State ====
 static uint32_t g_stateRev = 0;
 
+// §4.3 (Spec): EIN Mutex schuetzt fans[]-Felder, die der esp-mqtt-Task liest, waehrend der
+// Loop-Task sie schreibt — plus die Pending-Cleanup-Liste. Disziplin: NIE ueber Socket-I/O
+// (mqtt.publish) halten -> unter Lock snapshotten, Lock freigeben, DANN senden. Fundament fuer
+// den Dual-Core-Split (Stufe 3); behebt heute schon den §19-Datarace Loop<->esp-mqtt-Task.
+static SemaphoreHandle_t fansMutex = nullptr;
+static PendingCleanup    g_pendingCleanup = {};
+static inline void fansLock()   { if (fansMutex) xSemaphoreTake(fansMutex, portMAX_DELAY); }
+static inline void fansUnlock() { if (fansMutex) xSemaphoreGive(fansMutex); }
+// §18: einen sanitized Namen zum Nachraeumen vormerken (Loop-Task; Liste ist Cross-Task -> Lock).
+static void pendingCleanupQueue(const char *sanitizedName) {
+  fansLock();
+  bool ok = pendingCleanupAdd(g_pendingCleanup, sanitizedName);
+  fansUnlock();
+  if (!ok) LOGW("MQTT", "cleanup-Liste voll - Topic verwaist");
+}
+
 // ==== Netz/MQTT-Objekte (nativer ETH.h-Stack) ====
 NetworkServer    httpServer(80);
 ESP32MQTTClient  mqtt;   // esp-mqtt im eigenen FreeRTOS-Task, thread-safe, Auto-Reconnect
@@ -379,7 +395,15 @@ static String    g_mqttLwtTopic;
 // ==== MQTT Helpers ====
 static String topicDev() { return String(mqttConfig.prefix) + "/" + deviceId; }
 // Flaches Schema (Spec §4): <prefix>/<deviceId>/<name>/{speed,set,rpm}
-static String topicFan(uint8_t i) { return topicDev() + "/" + sanitizeName(fans[i].name); }
+// §19: Namen unter Lock snapshotten — der Loop-Task kann fans[i].name gerade memset/strcpy'en.
+static String topicFan(uint8_t i) {
+  char name[20]; uint8_t n = 0;
+  fansLock();
+  for (; n < sizeof(name) - 1 && fans[i].name[n]; n++) name[n] = fans[i].name[n];
+  name[n] = 0;
+  fansUnlock();
+  return topicDev() + "/" + sanitizeName(String(name));
+}
 
 // pctFromDuty/dutyFromPct kommen aus fw_util.h (host-getestet)
 
@@ -780,6 +804,16 @@ static void mqttSubscribeFan(uint8_t i) {
 void onMqttConnect(esp_mqtt_client_handle_t client) {
   if (!mqtt.isMyTurn(client)) return;
   mqtt.publish((topicDev() + "/status").c_str(), "online", 0, true);
+  // §18: ZUERST verwaiste retained Topics aus der Disconnect-Phase raeumen (snapshot-then-send) —
+  // vor dem present-Loop, damit ein im selben Slot neu angelegter, gleichnamiger Luefter zuletzt
+  // gewinnt (Subscribe/Publish nicht versehentlich vom Cleanup ueberschrieben).
+  PendingCleanup snap;
+  fansLock(); snap = g_pendingCleanup; pendingCleanupClear(g_pendingCleanup); fansUnlock();
+  for (uint8_t k = 0; k < snap.count; k++) {
+    String base = topicDev() + "/" + snap.names[k];
+    mqtt.publish((base + "/speed").c_str(), "", 0, true);
+    mqtt.unsubscribe((base + "/set").c_str());
+  }
   for (uint8_t i = 0; i < MAX_FANS; i++) {
     if (!fanPresentIdx(i)) continue;
     mqttSubscribeFan(i);
@@ -808,10 +842,15 @@ static void applyDo(uint8_t idx) {
     if (!isPinBlocked(f.pwmPin)) { ledcWrite(f.pwmPin, 0); ledcDetach(f.pwmPin); }
     detachFanCounters(idx);
 
-    if (mqtt.isConnected() && f.name[0]) {
-      String baseOld = String(mqttConfig.prefix) + "/" + deviceId + "/" + sanitizeName(String(f.name));
-      mqtt.publish((baseOld + "/speed").c_str(), "", 0, true);
-      mqtt.unsubscribe((baseOld + "/set").c_str());
+    if (f.name[0]) {
+      String sname = sanitizeName(String(f.name));
+      if (mqtt.isConnected()) {
+        String baseOld = topicDev() + "/" + sname;
+        mqtt.publish((baseOld + "/speed").c_str(), "", 0, true);
+        mqtt.unsubscribe((baseOld + "/set").c_str());
+      } else {
+        pendingCleanupQueue(sname.c_str());   // §18: bei Disconnect vormerken -> onMqttConnect raeumt nach
+      }
     }
 
     clearFanNVS(idx);
@@ -821,8 +860,10 @@ static void applyDo(uint8_t idx) {
     g_pendingDuty[idx]   = -1;
     g_lastSavedDuty[idx] = 0;
     g_stateDirty[idx]    = false;
+    fansLock();                         // §19: gegen Cross-Task-Leser (topicFan im esp-mqtt-Task)
     memset(&f, 0, sizeof(Fan));
     f.pwmPin = 0xFF; f.tachPin = 0xFF;
+    fansUnlock();
     g_lastRpmSent[idx] = 0;
 
     rebuildPcntMap();
@@ -834,12 +875,17 @@ static void applyDo(uint8_t idx) {
 
   // Name change
   if (j.nameChanged) {
-    if (mqtt.isConnected() && f.name[0]) {  // alten Topic nur raeumen, wenn es einen gab (nicht bei Neuanlage)
-      String oldBase = String(mqttConfig.prefix) + "/" + deviceId + "/" + sanitizeName(String(f.name));
-      mqtt.publish((oldBase + "/speed").c_str(), "", 0, true);
-      mqtt.unsubscribe((oldBase + "/set").c_str());
+    if (f.name[0]) {  // alten Topic nur raeumen, wenn es einen gab (nicht bei Neuanlage)
+      String sname = sanitizeName(String(f.name));
+      if (mqtt.isConnected()) {
+        String oldBase = topicDev() + "/" + sname;
+        mqtt.publish((oldBase + "/speed").c_str(), "", 0, true);
+        mqtt.unsubscribe((oldBase + "/set").c_str());
+      } else {
+        pendingCleanupQueue(sname.c_str());   // §18: bei Disconnect vormerken
+      }
     }
-    safeStrcpy(f.name, sizeof(f.name), String(j.name));
+    fansLock(); safeStrcpy(f.name, sizeof(f.name), String(j.name)); fansUnlock();   // §19
     if (mqtt.isConnected()) { mqttSubscribeFan(idx); mqttPublishSpeed(idx); }
     Preferences p; p.begin("fans", false);
     p.putString((String("f") + idx + "_name").c_str(), f.name);
@@ -1408,6 +1454,9 @@ void setup() {
   Serial.begin(115200);
   delay(200);
   Serial.println(F("== ESP32-S3-ETH Fan Controller v4.0 =="));
+
+  // §4.3: fans[]-/Cleanup-Mutex VOR dem esp-mqtt-Task anlegen (loopStart() weiter unten).
+  fansMutex = xSemaphoreCreateMutex();
 
   // Anti-Brick: Task-WDT bleibt AKTIV und ueberwacht den Loop-Task.
   // 8 s Budget; Panic => Reboot => ggf. Bootloader-Rollback (Spec §3.1/3.2).
