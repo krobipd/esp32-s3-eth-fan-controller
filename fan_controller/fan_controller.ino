@@ -823,12 +823,18 @@ static void mqttApplySet(uint8_t idx, const std::string &payload) {
   if (!hasDigit) { LOGW("MQTT", "set ohne Zahl ignoriert"); return; }
   int pct = constrain(atoi(payload.c_str()), 0, 100);
   if (idx < MAX_FANS && fanPresentIdx(idx)) {
-    dutyEnqueue(idx, dutyFromPct((uint8_t)pct));   // Cross-Task -> Duty-Queue (Stufe 3: FreeRTOS-Queue)
-    LOGI("MQTT", String("set ") + fans[idx].name + " -> " + pct + "%");
+    dutyEnqueue(idx, dutyFromPct((uint8_t)pct));   // Cross-Task -> Duty-Queue
+    char nm[20]; fansLock(); { uint8_t n=0; for(; n<19 && fans[idx].name[n]; n++) nm[n]=fans[idx].name[n]; nm[n]=0; } fansUnlock();  // §19: Name fuer Log unter Lock
+    LOGI("MQTT", String("set ") + nm + " -> " + pct + "%");
   }
 }
 
-static bool ethHasIP = false, httpUp = false;
+static bool                  ethHasIP = false;   // nur im networkTask (Core 0) benutzt
+static std::atomic<bool>     httpUp{false};       // networkTask setzt; Health-Window (loopTask) liest -> Commit-Gate
+static std::atomic<uint32_t> g_netCtr{0};         // networkTask-Heartbeat (Liveness: Commit-Gate + /api/status)
+static std::atomic<uint32_t> g_loopCtr{0};        // Control-Loop-Heartbeat (Liveness)
+static TaskHandle_t          g_netTaskHandle = nullptr;
+static inline void feedWdt() { esp_task_wdt_reset(); }   // §5.3: fuettert den AKTUELLEN Task (beide abonniert)
 
 // Jeden vorhandenen Lüfter auf .../set abonnieren (idx-gebundenes Lambda).
 static void mqttSubscribeFan(uint8_t i) {
@@ -1023,7 +1029,7 @@ static void sendUiAsset(NetworkClient &c) {
     size_t n = (UI_ASSET_LEN - off) < 1024 ? (UI_ASSET_LEN - off) : 1024;
     if (c.write(UI_ASSET + off, n) == 0) return;
     off += n;
-    feedLoopWDT();
+    feedWdt();
   }
 }
 
@@ -1054,7 +1060,7 @@ static bool readLine(NetworkClient &c, String &out, unsigned long timeoutMs) {
       out += ch;
       if (out.length() > 4096) return true;
     }
-    feedLoopWDT();
+    feedWdt();
     delay(1);
   }
   return (out.length() > 0);
@@ -1101,7 +1107,7 @@ static bool handleBodyToString(NetworkClient &c, size_t contentLength, String &o
         out.concat((const char*)b);
         got += rd; t0 = millis();
       }
-    } else { feedLoopWDT(); delay(1); }
+    } else { feedWdt(); delay(1); }
   }
   return (got == contentLength);
 }
@@ -1132,7 +1138,7 @@ static void printChunked(NetworkClient &c, const char *s, size_t len) {
     size_t n = len < 1024 ? len : 1024;
     if (c.write((const uint8_t *)s, n) == 0) return;
     s += n; len -= n;
-    feedLoopWDT();
+    feedWdt();
   }
 }
 
@@ -1153,6 +1159,9 @@ static void sendJsonStatus(NetworkClient &c) {
   c.print(F(",\"largest_block\":")); c.print(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
   c.print(F(",\"uptime_s\":")); c.print((uint32_t)(esp_timer_get_time() / 1000000ULL));
   c.print(F(",\"wdt\":true"));
+  c.print(F(",\"core1_loops\":")); c.print(g_loopCtr.load());        // §8: Control-Liveness
+  c.print(F(",\"net_loops\":")); c.print(g_netCtr.load());          // §8: networkTask-Liveness
+  c.print(F(",\"net_stack_hwm\":")); c.print(g_netTaskHandle ? uxTaskGetStackHighWaterMark(g_netTaskHandle) : 0);  // §9
   c.print(F(",\"ota_pending\":")); c.print(g_otaPendingVerify.load() ? "true" : "false");
   c.print(F(",\"crash_streak\":")); c.print((int)g_crashStreak);
   c.print(F(",\"mqtt\":{\"enabled\":")); c.print(mqttConfig.enabled ? "true" : "false");
@@ -1270,7 +1279,7 @@ static bool handleOTA(NetworkClient &c, size_t contentLength) {
   while (received < contentLength && !elapsed(millis(), t0, BODY_RD_TIMEOUT)) {
     int n = c.read(buf, min((int)BUFSZ, (int)(contentLength - received)));
     if (n > 0) {
-      feedLoopWDT();
+      feedWdt();
       size_t w = Update.write(buf, n);
       if (w != (size_t)n) {
         httpSendHeaderOK(c, "application/json; charset=UTF-8");
@@ -1282,7 +1291,7 @@ static bool handleOTA(NetworkClient &c, size_t contentLength) {
       received += n; t0 = millis();
       int pct = (int)((received * 100UL) / contentLength);
       if (pct != lastPct && (pct % 5 == 0 || pct >= 99)) { LOGI("OTA", String("progress ") + pct + "%"); lastPct = pct; }
-    } else { feedLoopWDT(); delay(1); }
+    } else { feedWdt(); delay(1); }
   }
   if (received != contentLength) {
     httpSendHeaderOK(c, "application/json; charset=UTF-8");
@@ -1509,6 +1518,52 @@ static void restoreSavedDuties() {
   if (restored > 0) LOGI("STATE", String("restored ") + restored + " duty values from NVS");
 }
 
+// §5.3: Netz-Task auf Core 0 — Link-Watch + HTTP + Telemetrie-/Log-Drains.
+// Der Control-Loop bleibt im Arduino-loopTask (Core 1). Dieser Task wird beim TWDT abonniert,
+// damit ein Hang (z.B. W5500-SPI, §12A) zum Panic-Reboot -> Bootloader-Rollback fuehrt.
+static void networkTask(void *arg) {
+  (void)arg;
+  esp_task_wdt_add(nullptr);
+  for (;;) {
+    esp_task_wdt_reset();
+    g_netCtr.fetch_add(1);
+    uint32_t now = millis();
+
+    // Netz-Status aus async ETH-Events
+    bool ipNow = ethHasIp();
+    if (ipNow && !httpUp.load()) { httpServer.begin(); ethStartMdns(); httpUp.store(true); LOGI("NET", String("IP: ") + ethLocalIp()); }
+    if (!ipNow && httpUp.load() && !ethLinkUp()) httpUp.store(false);   // Link weg -> Server pausiert
+    ethHasIP = ipNow;
+    // Link > 15 s weg -> harter Treiber-Reset (Cooldown 5 s). DHCP-Lease erneuert esp-netif selbst.
+    if (!ethLinkUp()) {
+      if (g_linkLostSince == 0) g_linkLostSince = now;
+      if (elapsed(now, g_linkLostSince, ETH_LINK_LOST_RESET_MS) && elapsed(now, g_lastEthReinit, ETH_REINIT_COOLDOWN_MS)) {
+        LOGW("NET", "link down >15s -> ETH hard reset");
+        g_lastEthReinit = now;
+        httpUp.store(false);
+        ethHardReset();
+      }
+    } else {
+      g_linkLostSince = 0;
+    }
+
+    // HTTP
+    if (httpUp.load() && ethHasIP) {
+      NetworkClient c = httpServer.accept();
+      if (c) {
+        uint32_t t0 = millis();
+        while (c.connected() && !c.available() && !elapsed(millis(), t0, 400)) { feedWdt(); delay(1); }
+        if (!c.available()) c.stop();
+        else { handleClient(c); delay(1); c.stop(); }
+      }
+    }
+
+    telemDrain();   // Telemetrie -> MQTT publishen (Netz-Kontext)
+    logDrain();     // Log-Queue -> gLogBuf
+    delay(2);
+  }
+}
+
 // ==== setup() ====
 void setup() {
   Serial.begin(115200);
@@ -1579,9 +1634,9 @@ void setup() {
 
   // [Stufe2/1] Nativer W5500-Treiber (ETH.h). DHCP laeuft async; das GOT_IP-Event
   // setzt g_ethHasIp; httpServer wird in loop() gestartet, sobald die IP da ist.
-  feedLoopWDT();
+  feedWdt();
   if (!ethBegin()) LOGE("NET", "ETH.begin failed");
-  feedLoopWDT();
+  feedWdt();
 
   // [Stufe2/2] esp-mqtt zuletzt starten (Task läuft eigenständig, Auto-Reconnect; onMqttConnect
   // feuert erst, wenn alles oben initialisiert ist). Nur wenn aktiviert + nicht im Safe-Mode.
@@ -1599,23 +1654,41 @@ void setup() {
   }
 
   LOGI("BOOT", "Setup complete.");
-  logDrain();   // §4.6: Setup-Log-Burst aus der Queue in gLogBuf flushen
+  logDrain();   // §4.6: Setup-Log-Burst aus der Queue in gLogBuf flushen (vor Task-Start)
+
+  // §5.3: Netz-Task auf Core 0 starten (Control bleibt loopTask/Core 1, anderer Core -> keine
+  // Prio-Konkurrenz). Stack 8 KB konservativ (HTTP, kein TLS) -> in Stufe 9 per
+  // uxTaskGetStackHighWaterMark pruefen. Prio 5 = wie der esp-mqtt-Task (beide auf Core 0; net
+  // yieldet per delay(2), daher keine MQTT-Starvation).
+  xTaskCreatePinnedToCore(networkTask, "net", 8192, nullptr, 5, &g_netTaskHandle, 0);
 }
 
 // ==== loop() ====
 void loop() {
   static uint32_t lastMeasureTick = 0;
   const uint32_t now = millis();
+  g_loopCtr.fetch_add(1);   // §8: Control-Loop-Liveness (Heartbeat)
 
-  // [Stufe2/1] Netz-gebundenes Health-Window (aus Stufe 3 vorgezogen, da Stufe 1 der
-  // Netz-Umbau ist): ein Image, das KEINE IP bekommt, darf sich NICHT gueltig markieren
-  // (sonst Soft-Brick: laeuft, aber unerreichbar). Bei "keine IP nach 120s" Selbst-Neustart
-  // OHNE commit => Bootloader rollt auf v4.0 zurueck.
+  // [Stufe2/1 + Stufe3] Netz-gebundenes Health-Window. NACH dem Dual-Core-Split beweist "IP da"
+  // allein NICHT mehr Erreichbarkeit: der W5500-Treiber-Task haelt die IP auch dann, wenn der
+  // networkTask defekt ist (Stack/HTTP-begin) -> sonst Soft-Brick. Daher Commit nur mit POSITIVEM
+  // Beweis: HTTP hochgebracht (httpUp) UND networkTask tickt (Heartbeat in den letzten 5s).
+  // Crash/Hang des networkTask faengt separat der TWDT (Panic-Reboot). Nie erreichbar bis 120s
+  // -> Selbst-Neustart OHNE commit -> Bootloader-Rollback auf v4.0.
   if (g_otaPendingVerify.load()) {
-    if (now > OTA_HEALTH_MS && ethHasIp()) {
+    static uint32_t lastNetCtr = 0, lastNetChkMs = 0;
+    static bool netTicking = false;
+    if (lastNetChkMs == 0) lastNetChkMs = now;
+    if (elapsed(now, lastNetChkMs, 5000)) {
+      uint32_t nc = g_netCtr.load();
+      netTicking = (nc != lastNetCtr);
+      lastNetCtr = nc; lastNetChkMs = now;
+    }
+    bool reachable = ethHasIp() && httpUp.load() && netTicking;
+    if (now > OTA_HEALTH_MS && reachable) {
       commitIfPending();
-    } else if (now > 120000UL && !ethHasIp()) {
-      LOGE("OTA", "kein IP nach 120s -> Selbst-Neustart, Rollback auf v4.0");
+    } else if (now > 120000UL && !reachable) {
+      LOGE("OTA", "nicht erreichbar (IP+HTTP+net-heartbeat) in 120s -> Selbst-Neustart, Rollback auf v4.0");
       persistLogTail();
       delay(100);
       esp_restart();   // ohne commit -> PENDING_VERIFY bleibt -> Bootloader-Rollback
@@ -1632,36 +1705,7 @@ void loop() {
   // --- Duty-Queue ---
   dutyProcessQueue();
 
-  // --- Netz-Status aus async Link-Events (ETH.h) ---
-  bool ipNow = ethHasIp();
-  if (ipNow && !httpUp) { httpServer.begin(); ethStartMdns(); httpUp = true; LOGI("NET", String("IP: ") + ethLocalIp()); }
-  if (!ipNow && httpUp && !ethLinkUp()) httpUp = false;  // Link weg -> Server pausiert
-  ethHasIP = ipNow;
-  // Link > 15 s weg -> harter Treiber-Reset (Cooldown 5 s). DHCP-Lease erneuert esp-netif selbst.
-  if (!ethLinkUp()) {
-    if (g_linkLostSince == 0) g_linkLostSince = now;
-    if (elapsed(now, g_linkLostSince, ETH_LINK_LOST_RESET_MS) && elapsed(now, g_lastEthReinit, ETH_REINIT_COOLDOWN_MS)) {
-      LOGW("NET", "link down >15s -> ETH hard reset");
-      g_lastEthReinit = now;
-      httpUp = false;
-      ethHardReset();
-    }
-  } else {
-    g_linkLostSince = 0;
-  }
-
-  // --- HTTP Server ---
-  if (httpUp && ethHasIP) {
-    NetworkClient c = httpServer.accept();
-    if (c) {
-      unsigned long t0 = now;
-      while (c.connected() && !c.available() && !elapsed(millis(), t0, 400)) { feedLoopWDT(); delay(1); }
-      if (!c.available()) c.stop();
-      else { handleClient(c); delay(1); c.stop(); }
-    }
-  }
-
-  // --- MQTT --- läuft im eigenen esp-mqtt-Task (loopStart in setup); nichts im Loop nötig.
+  // --- Netz (Link-Watch + HTTP) + MQTT laufen jetzt im networkTask (Core 0) bzw. esp-mqtt-Task ---
 
   // --- Storm-Recovery ---
   for (uint8_t i = 0; i < MAX_FANS; i++) {
@@ -1747,10 +1791,6 @@ void loop() {
 
   // --- Duty-State persistieren ---
   stateFlushIfNeeded(now);
-
-  // --- Telemetrie + Log -> Senken (vorlaeufig im Loop; Task 8 verschiebt das in den networkTask) ---
-  telemDrain();
-  logDrain();
 
   // --- Log-Tail persistieren ---
   static uint32_t lastLogFlush = 0;
