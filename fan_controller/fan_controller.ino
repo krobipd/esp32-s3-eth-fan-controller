@@ -1170,24 +1170,39 @@ static void sendJsonStatus(NetworkClient &c) {
       if (!ft) c.print(','); ft = false; c.print(p);
     } }
   c.print(F("]"));
+  // §4.3: alle pro-Luefter-Felder unter EINEM Lock snapshotten, dann serialisieren (nie Lock ueber Socket).
+  struct FanView { char name[20], cnote[40]; bool occupied, present, validated, inv;
+                   uint8_t duty, pwmPin, tachPin, calMinStart, fault; uint16_t rpm; };
+  FanView v[MAX_FANS];
+  fansLock();
+  for (uint8_t i = 0; i < MAX_FANS; i++) {
+    Fan &f = fans[i];
+    v[i].occupied = (f.name[0] != 0);
+    v[i].present  = fanPresentIdx(i);
+    { uint8_t n = 0; for (; n < 19 && f.name[n];    n++) v[i].name[n]  = f.name[n];    v[i].name[n]  = 0; }
+    { uint8_t n = 0; for (; n < 39 && f.calNote[n]; n++) v[i].cnote[n] = f.calNote[n]; v[i].cnote[n] = 0; }
+    v[i].duty = f.duty; v[i].pwmPin = f.pwmPin; v[i].tachPin = f.tachPin; v[i].calMinStart = f.calMinStart;
+    v[i].rpm = f.rpmShown; v[i].fault = (uint8_t)f.fault; v[i].validated = f.validated; v[i].inv = f.invertPwm;
+  }
+  fansUnlock();
   c.print(F(",\"fans\":["));
   bool first = true;
   for (uint8_t i = 0; i < MAX_FANS; i++) {
-    if (fans[i].name[0] == 0) continue;  // alle belegten Slots (auch unkonfigurierte)
+    if (!v[i].occupied) continue;  // alle belegten Slots (auch unkonfigurierte)
     if (!first) c.print(','); first = false;
     c.print(F("{\"index\":")); c.print(i);
-    c.print(F(",\"name\":")); jsonPrintEscaped(c, fans[i].name);
-    c.print(F(",\"present\":")); c.print(fanPresentIdx(i) ? "true" : "false");
-    c.print(F(",\"pwm\":")); c.print(fans[i].duty);
-    c.print(F(",\"pct\":")); c.print((int)pctFromDuty(fans[i].duty));
-    c.print(F(",\"rpm\":")); c.print(fans[i].rpmShown);
-    c.print(F(",\"pwmPin\":")); c.print(fans[i].pwmPin);
-    c.print(F(",\"tachPin\":")); c.print(fans[i].tachPin);
-    c.print(F(",\"fault\":")); c.print((int)fans[i].fault);
-    c.print(F(",\"validated\":")); c.print(fans[i].validated ? "true" : "false");
-    c.print(F(",\"inv\":")); c.print(fans[i].invertPwm ? "true" : "false");
-    c.print(F(",\"cmin\":")); c.print((int)pctFromDuty(fans[i].calMinStart));
-    c.print(F(",\"cnote\":")); jsonPrintEscaped(c, fans[i].calNote);
+    c.print(F(",\"name\":")); jsonPrintEscaped(c, v[i].name);
+    c.print(F(",\"present\":")); c.print(v[i].present ? "true" : "false");
+    c.print(F(",\"pwm\":")); c.print(v[i].duty);
+    c.print(F(",\"pct\":")); c.print((int)pctFromDuty(v[i].duty));
+    c.print(F(",\"rpm\":")); c.print(v[i].rpm);
+    c.print(F(",\"pwmPin\":")); c.print(v[i].pwmPin);
+    c.print(F(",\"tachPin\":")); c.print(v[i].tachPin);
+    c.print(F(",\"fault\":")); c.print((int)v[i].fault);
+    c.print(F(",\"validated\":")); c.print(v[i].validated ? "true" : "false");
+    c.print(F(",\"inv\":")); c.print(v[i].inv ? "true" : "false");
+    c.print(F(",\"cmin\":")); c.print((int)pctFromDuty(v[i].calMinStart));
+    c.print(F(",\"cnote\":")); jsonPrintEscaped(c, v[i].cnote);
     c.print(F("}"));
   }
   c.print(F("]}"));
