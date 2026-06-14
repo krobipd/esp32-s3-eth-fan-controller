@@ -728,32 +728,22 @@ static void applyQueue(uint8_t idx, const ApplyJob &src) {
        " pins=" + (src.pinsChanged ? "1" : "0") + " name=" + (src.nameChanged ? "1" : "0"));
 }
 
-// ==== Duty-Queue (HTTP/MQTT entkoppelt) ====
-static volatile int16_t g_pendingDuty[MAX_FANS];
-static volatile bool    g_pendingDutyAny = false;
-
-static void dutyPendingInit() {
-  for (uint8_t i = 0; i < MAX_FANS; i++) g_pendingDuty[i] = -1;
-  g_pendingDutyAny = false;
-}
+// ==== Duty-Queue (§4.2: FreeRTOS-Queue Core0->Core1, ersetzt g_pendingDuty[]) ====
+// Producer (Netz: HTTP/MQTT) postet nur; der Consumer (Control-Core) validiert gegen fans[].
 static inline void dutyEnqueue(uint8_t idx, uint8_t duty) {
-  if (idx >= MAX_FANS || !fanPresentIdx(idx)) return;
-  g_pendingDuty[idx] = (int16_t)duty;
-  g_pendingDutyAny = true;
+  if (idx >= MAX_FANS) return;
+  DutyCmd d = { idx, duty };
+  dutyPost(d);
 }
 static void dutyProcessQueue() {
-  if (!g_pendingDutyAny) return;
-  bool any = false;
-  for (uint8_t i = 0; i < MAX_FANS; i++) {
-    int16_t d = g_pendingDuty[i];
-    if (d >= 0) {
-      g_pendingDuty[i] = -1;
-      fanSetDuty(fans[i], (uint8_t)d);
-      onDutyChanged(i);
+  if (!g_dutyQ) return;
+  DutyCmd d;
+  while (xQueueReceive(g_dutyQ, &d, 0) == pdTRUE) {
+    if (d.idx < MAX_FANS && fanPresentIdx(d.idx)) {
+      fanSetDuty(fans[d.idx], d.duty);
+      onDutyChanged(d.idx);
     }
-    if (g_pendingDuty[i] >= 0) any = true;
   }
-  g_pendingDutyAny = any;
 }
 
 // ==== MQTT Publish/Subscribe ====
@@ -877,8 +867,7 @@ static void applyDo(uint8_t idx) {
     // Persistierten Duty im RICHTIGEN Namespace ("state") raeumen + RAM-Tracking nullen,
     // sonst erbt ein neuer Luefter im selben Slot nach Reboot die alte Drehzahl.
     { Preferences p; p.begin("state", false); p.remove((String("f") + idx + "_duty").c_str()); p.end(); }
-    g_pendingDuty[idx]   = -1;
-    g_lastSavedDuty[idx] = 0;
+    g_lastSavedDuty[idx] = 0;   // stale DutyCmd in g_dutyQ wird beim Drain via fanPresentIdx verworfen
     g_stateDirty[idx]    = false;
     fansLock();                         // §19: gegen Cross-Task-Leser (topicFan im esp-mqtt-Task)
     memset(&f, 0, sizeof(Fan));
@@ -1512,7 +1501,7 @@ void setup() {
   loadConfigFans();
   loadMQTTConfig();
   buildMacAndDeviceId();
-  dutyPendingInit();
+  // (Duty-Queue wird in concurrencyInit() oben angelegt — kein separates Init mehr)
 
   // Hardware auf 0, dann Tach-Pullups
   ledcInitAllPresentToZero();
