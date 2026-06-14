@@ -1329,23 +1329,29 @@ static void apiFanSave(NetworkClient &c, const String &body) {
   String s;
   if (!formGet(body, F("idx"), s) && !formGet(body, F("fan"), s)) { apiErr(c, "missing idx"); return; }
   int idx = s.toInt();
+  // §4.3: alle Namen EINMAL unter Lock snapshotten — applyDo (Control-Core) schreibt fans[].name
+  // parallel; sanitizeName liest das ganze Array (Multi-Byte) -> sonst torn read nach dem Split.
+  char names[MAX_FANS][20];
+  fansLock();
+  for (uint8_t i = 0; i < MAX_FANS; i++) { uint8_t n = 0; for (; n < 19 && fans[i].name[n]; n++) names[i][n] = fans[i].name[n]; names[i][n] = 0; }
+  fansUnlock();
   bool isNew = (idx < 0);   // idx<0 => neuer Luefter: ersten freien Slot ERST HIER belegen (kein Phantom-Slot beim Klick)
   if (isNew) {
     idx = -1;
-    for (uint8_t i = 0; i < MAX_FANS; i++) if (fans[i].name[0] == 0) { idx = (int)i; break; }
+    for (uint8_t i = 0; i < MAX_FANS; i++) if (names[i][0] == 0) { idx = (int)i; break; }
     if (idx < 0) { apiErr(c, "no free slot"); return; }
   }
   if (idx < 0 || idx >= MAX_FANS) { apiErr(c, "bad idx"); return; }
-  Fan &f = fans[idx];
+  Fan &f = fans[idx];   // nur fuer Einzelbyte-Felder (pwmPin/tachPin/invertPwm) — benigne Race
 
-  String newName = String(f.name);
+  String newName = String(names[idx]);
   if (formGet(body, F("name"), s)) newName = s;
   { String rt = newName; rt.trim(); if (rt.isEmpty()) { apiErr(c, "name required"); return; } }  // kein leerer Name (sonst sanitize->"fan"-Fallback = unsichtbarer Geist)
   String cleanName = sanitizeName(newName);
   if (!fanNameValid(cleanName.c_str())) { apiErr(c, "invalid name"); return; }
   for (uint8_t i = 0; i < MAX_FANS; i++) {  // Topic-Kollision (Spec §4): gegen ALLE belegten Slots, nicht nur present-e
-    if ((int)i == idx || fans[i].name[0] == 0) continue;
-    if (sanitizeName(fans[i].name) == cleanName) { apiErr(c, "name in use"); return; }
+    if ((int)i == idx || names[i][0] == 0) continue;
+    if (sanitizeName(String(names[i])) == cleanName) { apiErr(c, "name in use"); return; }
   }
 
   bool inv = f.invertPwm;  // Default = Ist-Zustand: fehlt das Feld (Nicht-UI-Client), bleibt invert erhalten
@@ -1361,7 +1367,7 @@ static void apiFanSave(NetworkClient &c, const String &body) {
   ApplyJob j; j.idx = (uint8_t)idx;
   // isNew: Name IMMER schreiben — sonst bleibt bei cleanName=="fan" (leer/"Fan"/Sonderzeichen) nameChanged false
   // und der Slot wuerde mit Pins, aber ohne Namen angelegt = unsichtbarer Geist (nicht present).
-  if (isNew || sanitizeName(String(f.name)) != cleanName) { safeStrcpy(j.name, sizeof(j.name), cleanName); j.nameChanged = true; }
+  if (isNew || sanitizeName(String(names[idx])) != cleanName) { safeStrcpy(j.name, sizeof(j.name), cleanName); j.nameChanged = true; }
   if (inv != f.invertPwm) { j.invert = inv; j.invChanged = true; }
   if (newPwm != f.pwmPin || newTac != f.tachPin) { j.pwmPin = newPwm; j.tachPin = newTac; j.pinsChanged = true; }
   if (j.nameChanged || j.invChanged || j.pinsChanged) applyQueue((uint8_t)idx, j);
