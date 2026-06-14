@@ -829,16 +829,13 @@ static void applyDo(uint8_t idx) {
 
   // Name change
   if (j.nameChanged) {
-    if (mqtt.isConnected()) {
+    if (mqtt.isConnected() && f.name[0]) {  // alten Topic nur raeumen, wenn es einen gab (nicht bei Neuanlage)
       String oldBase = String(mqttConfig.prefix) + "/" + deviceId + "/" + sanitizeName(String(f.name));
       mqtt.publish((oldBase + "/speed").c_str(), "", 0, true);
       mqtt.unsubscribe((oldBase + "/set").c_str());
-      safeStrcpy(f.name, sizeof(f.name), String(j.name));
-      mqttSubscribeFan(idx);
-      mqttPublishSpeed(idx);
-    } else {
-      safeStrcpy(f.name, sizeof(f.name), String(j.name));
     }
+    safeStrcpy(f.name, sizeof(f.name), String(j.name));
+    if (mqtt.isConnected()) { mqttSubscribeFan(idx); mqttPublishSpeed(idx); }
     Preferences p; p.begin("fans", false);
     p.putString((String("f") + idx + "_name").c_str(), f.name);
     p.end();
@@ -1213,6 +1210,12 @@ static void apiFanSave(NetworkClient &c, const String &body) {
   String s;
   if (!formGet(body, F("idx"), s) && !formGet(body, F("fan"), s)) { apiErr(c, "missing idx"); return; }
   int idx = s.toInt();
+  bool isNew = (idx < 0);   // idx<0 => neuer Luefter: ersten freien Slot ERST HIER belegen (kein Phantom-Slot beim Klick)
+  if (isNew) {
+    idx = -1;
+    for (uint8_t i = 0; i < MAX_FANS; i++) if (fans[i].name[0] == 0) { idx = (int)i; break; }
+    if (idx < 0) { apiErr(c, "no free slot"); return; }
+  }
   if (idx < 0 || idx >= MAX_FANS) { apiErr(c, "bad idx"); return; }
   Fan &f = fans[idx];
 
@@ -1232,6 +1235,7 @@ static void apiFanSave(NetworkClient &c, const String &body) {
   if (formGet(body, F("tach"), s)) newTac = (uint8_t)constrain(s.toInt(), 0, 255);
   if (newPwm != f.pwmPin && !validPwmForFan(newPwm,  (int8_t)idx)) { apiErr(c, "pwm pin invalid/busy"); return; }
   if (newTac != f.tachPin && !validTachForFan(newTac, (int8_t)idx)) { apiErr(c, "tach pin invalid/busy"); return; }
+  if (isNew && (newPwm == 0xFF || newTac == 0xFF)) { apiErr(c, "pins required"); return; }  // neuer Luefter braucht Pins
 
   ApplyJob j; j.idx = (uint8_t)idx;
   if (sanitizeName(String(f.name)) != cleanName) { safeStrcpy(j.name, sizeof(j.name), cleanName); j.nameChanged = true; }
@@ -1245,23 +1249,11 @@ static void apiFanDelete(NetworkClient &c, const String &body) {
   String s;
   if (!formGet(body, F("idx"), s)) { apiErr(c, "missing idx"); return; }
   int idx = s.toInt();
-  if (idx < 0 || idx >= MAX_FANS || !fanPresentIdx((uint8_t)idx)) { apiErr(c, "bad idx"); return; }
+  // Jeder BELEGTE Slot (Name gesetzt) ist loeschbar — auch unkonfiguriert (ohne Pins).
+  if (idx < 0 || idx >= MAX_FANS || fans[idx].name[0] == 0) { apiErr(c, "bad idx"); return; }
   ApplyJob j; j.idx = (uint8_t)idx; j.deleteFan = true;
   applyQueue((uint8_t)idx, j);
   apiOk(c);
-}
-
-static void apiFanNew(NetworkClient &c, const String &body) {
-  (void)body;
-  int idx = -1;  // [B8] freie Slots an pwmPin==0xFF erkennen
-  for (uint8_t i = 0; i < MAX_FANS; i++) if (fans[i].pwmPin == 0xFF) { idx = i; break; }
-  if (idx < 0) { apiErr(c, "no free slot"); return; }
-  fanInitDefaults((uint8_t)idx);
-  clearFanNVS((uint8_t)idx);
-  safeStrcpy(fans[idx].name, sizeof(fans[idx].name), String("fan") + String(idx + 1));
-  g_stateRev++;
-  httpSendHeaderOK(c, "application/json; charset=UTF-8");
-  c.print(F("{\"ok\":true,\"idx\":")); c.print(idx); c.print(F("}"));
 }
 
 static void apiCalib(NetworkClient &c, const String &body) {
@@ -1353,7 +1345,6 @@ static void handleClient(NetworkClient &c) {
     if (path == "/api/fan/set")        { handleFormPost(c, contentLength, contentType, apiFanSet); return; }
     if (path == "/api/fan/save")       { handleFormPost(c, contentLength, contentType, apiFanSave); return; }
     if (path == "/api/fan/delete")     { handleFormPost(c, contentLength, contentType, apiFanDelete); return; }
-    if (path == "/api/fan/new")        { apiFanNew(c, String("")); return; }
     if (path == "/api/calib")          { handleFormPost(c, contentLength, contentType, apiCalib); return; }
     if (path == "/api/mqtt")           { handleFormPost(c, contentLength, contentType, apiMqttSave); return; }
     if (path == "/api/safemode/reset") { apiSafeModeReset(c, String("")); return; }
