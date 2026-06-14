@@ -16,7 +16,7 @@ struct ApplyJob;
 #include <Arduino.h>
 #include <SPI.h>
 #include <Update.h>
-#include <PubSubClient.h>
+#include "ESP32MQTTClient.h"   // thread-safe esp-mqtt (eigener Task); ersetzt PubSubClient
 #include <Preferences.h>
 
 #include "fw_util.h"
@@ -372,9 +372,10 @@ static void fanAutoValidate(uint8_t idx) {
 static uint32_t g_stateRev = 0;
 
 // ==== Netz/MQTT-Objekte (nativer ETH.h-Stack) ====
-NetworkServer  httpServer(80);
-NetworkClient  mqttNetClient;        // TCP-Socket fuer PubSubClient ueber lwIP/esp-netif
-PubSubClient   mqtt(mqttNetClient);
+NetworkServer    httpServer(80);
+ESP32MQTTClient  mqtt;   // esp-mqtt im eigenen FreeRTOS-Task, thread-safe, Auto-Reconnect
+static String    g_mqttClientId;   // persistent (ESP32MQTTClient speichert nur den Pointer)
+static String    g_mqttLwtTopic;
 
 // ==== MQTT Helpers ====
 static String topicDev() { return String(mqttConfig.prefix) + "/" + deviceId; }
@@ -733,14 +734,13 @@ static void dutyProcessQueue() {
 static uint16_t g_lastRpmSent[MAX_FANS] = {0};
 
 static void mqttPublishSpeed(uint8_t i) {
-  if (!mqtt.connected() || !fanPresentIdx(i)) return;
+  if (!mqtt.isConnected() || !fanPresentIdx(i)) return;
   char b[4]; snprintf(b, sizeof(b), "%u", (unsigned)pctFromDuty(fans[i].duty));
-  String t = topicFan(i) + "/speed";
-  mqtt.publish(t.c_str(), b, true);
+  mqtt.publish((topicFan(i) + "/speed").c_str(), b, 0, true);
 }
 
 static void mqttPublishRPM(uint8_t i, bool force) {
-  if (!mqtt.connected() || !fanPresentIdx(i)) return;
+  if (!mqtt.isConnected() || !fanPresentIdx(i)) return;
   uint32_t now = millis();
   uint16_t rpm = fans[i].rpmShown;
   bool due = force;
@@ -752,85 +752,47 @@ static void mqttPublishRPM(uint8_t i, bool force) {
   if (!due) return;
 
   char b[12]; snprintf(b, sizeof(b), "%u", (unsigned)rpm);
-  String t = topicFan(i) + "/rpm";
-  mqtt.publish(t.c_str(), b, false);
+  mqtt.publish((topicFan(i) + "/rpm").c_str(), b, 0, false);
   fans[i].lastRpmPubMs = now;
   g_lastRpmSent[i] = rpm;
 }
 
-static void mqttCallback(char *topic, byte *payload, unsigned int length) {
-  String t(topic);
-  String pre = topicDev() + "/";
-  if (!t.startsWith(pre) || !t.endsWith(F("/set"))) return;
-  String fanKey = t.substring(pre.length(), t.length() - 4);  // ".../<name>/set"
-
-  char buf[8];
-  unsigned int n = min(length, (unsigned)sizeof(buf) - 1), j = 0;
+// Befehl von <prefix>/<deviceId>/<fan>/set anwenden. idx ist im Subscribe-Lambda gebunden,
+// daher kein Topic-Parsen nötig. [Review-Fund E] Payload ohne Ziffer ignorieren (kein 0%-Unfall).
+static void mqttApplySet(uint8_t idx, const std::string &payload) {
   bool hasDigit = false;
-  for (unsigned int i = 0; i < n; i++) {
-    if (payload[i] >= 32) buf[j++] = (char)payload[i];
-    if (payload[i] >= '0' && payload[i] <= '9') hasDigit = true;
-  }
-  buf[j] = 0;
-  // [Review-Fund E] Leere/ziffernlose Payload ignorieren statt versehentlich auf 0% zu fahren
-  // (schuetzt gegen Fehl-Publishes und geleerte retained Topics).
+  for (char c : payload) if (c >= '0' && c <= '9') { hasDigit = true; break; }
   if (!hasDigit) { LOGW("MQTT", "set ohne Zahl ignoriert"); return; }
-  int pct = constrain(atoi(buf), 0, 100);
-
-  for (uint8_t i = 0; i < MAX_FANS; i++) {
-    if (!fanPresentIdx(i)) continue;
-    if (sanitizeName(fans[i].name) == fanKey) {
-      dutyEnqueue(i, dutyFromPct((uint8_t)pct));
-      LOGI("MQTT", String("set ") + fans[i].name + " -> " + pct + "%");
-      return;
-    }
+  int pct = constrain(atoi(payload.c_str()), 0, 100);
+  if (idx < MAX_FANS && fanPresentIdx(idx)) {
+    dutyEnqueue(idx, dutyFromPct((uint8_t)pct));   // Cross-Task -> Duty-Queue (Stufe 3: FreeRTOS-Queue)
+    LOGI("MQTT", String("set ") + fans[idx].name + " -> " + pct + "%");
   }
-  LOGW("MQTT", "set for unknown fan");
 }
 
 static bool ethHasIP = false, httpUp = false;
-static bool mqttWasConnected = false;
-static uint32_t g_lastMqttTryMs = 0;
-static uint32_t g_mqttBackoffMs = 3000;
 
-static void mqttEnsureConnected() {
-  if (!mqttConfig.enabled || strlen(mqttConfig.host) == 0 || !ethHasIP) { mqttWasConnected = false; return; }
-  uint32_t now = millis();
+// Jeden vorhandenen Lüfter auf .../set abonnieren (idx-gebundenes Lambda).
+static void mqttSubscribeFan(uint8_t i) {
+  mqtt.subscribe((topicFan(i) + "/set").c_str(), [i](const std::string &p) { mqttApplySet(i, p); });
+}
 
-  if (mqtt.connected()) {
-    if (!mqttWasConnected) {
-      String willTopic = topicDev() + "/status";
-      mqtt.publish(willTopic.c_str(), "online", true);
-      for (uint8_t i = 0; i < MAX_FANS; i++) {
-        if (!fanPresentIdx(i)) continue;
-        mqtt.subscribe((topicFan(i) + "/set").c_str());
-        mqttPublishSpeed(i);
-      }
-      mqttWasConnected = true;
-      g_mqttBackoffMs = 3000;
-      g_lastMqttTryMs = now;
-      LOGI("MQTT", "connected");
-    }
-    return;
+// Von esp-mqtt bei (Re-)Connect aufgerufen (MQTT-Task-Kontext): online melden, abonnieren, Ist publishen.
+void onMqttConnect(esp_mqtt_client_handle_t client) {
+  if (!mqtt.isMyTurn(client)) return;
+  mqtt.publish((topicDev() + "/status").c_str(), "online", 0, true);
+  for (uint8_t i = 0; i < MAX_FANS; i++) {
+    if (!fanPresentIdx(i)) continue;
+    mqttSubscribeFan(i);
+    mqttPublishSpeed(i);
   }
+  LOGI("MQTT", "connected");
+}
 
-  if (!elapsed(now, g_lastMqttTryMs, g_mqttBackoffMs)) return;
-  g_lastMqttTryMs = now;
-
-  mqtt.setServer(mqttConfig.host, mqttConfig.port);
-  mqtt.setCallback(mqttCallback);
-
-  String willTopic = topicDev() + "/status";
-  bool ok = (strlen(mqttConfig.user) > 0)
-              ? mqtt.connect((deviceId + "-cli").c_str(), mqttConfig.user, mqttConfig.pass, willTopic.c_str(), 1, true, "offline")
-              : mqtt.connect((deviceId + "-cli").c_str(), NULL, NULL, willTopic.c_str(), 1, true, "offline");
-
-  if (ok) {
-    mqttWasConnected = false;
-  } else {
-    LOGW("MQTT", String("connect failed, state=") + mqtt.state());
-    g_mqttBackoffMs = min<uint32_t>(g_mqttBackoffMs * 2, 60000);
-  }
+// Event-Trampolin für esp-mqtt (IDF 5.x), von loopStart() registriert.
+void handleMQTT(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data) {
+  (void)handler_args; (void)base; (void)event_id;
+  mqtt.onEventCallback(static_cast<esp_mqtt_event_handle_t>(event_data));
 }
 
 // ==== Apply-Worker ====
@@ -847,9 +809,9 @@ static void applyDo(uint8_t idx) {
     if (!isPinBlocked(f.pwmPin)) { ledcWrite(f.pwmPin, 0); ledcDetach(f.pwmPin); }
     detachFanCounters(idx);
 
-    if (mqtt.connected() && f.name[0]) {
+    if (mqtt.isConnected() && f.name[0]) {
       String baseOld = String(mqttConfig.prefix) + "/" + deviceId + "/" + sanitizeName(String(f.name));
-      mqtt.publish((baseOld + "/speed").c_str(), "", true);
+      mqtt.publish((baseOld + "/speed").c_str(), "", 0, true);
       mqtt.unsubscribe((baseOld + "/set").c_str());
     }
 
@@ -867,12 +829,12 @@ static void applyDo(uint8_t idx) {
 
   // Name change
   if (j.nameChanged) {
-    if (mqtt.connected()) {
+    if (mqtt.isConnected()) {
       String oldBase = String(mqttConfig.prefix) + "/" + deviceId + "/" + sanitizeName(String(f.name));
-      mqtt.publish((oldBase + "/speed").c_str(), "", true);
+      mqtt.publish((oldBase + "/speed").c_str(), "", 0, true);
       mqtt.unsubscribe((oldBase + "/set").c_str());
       safeStrcpy(f.name, sizeof(f.name), String(j.name));
-      mqtt.subscribe((topicFan(idx) + "/set").c_str());
+      mqttSubscribeFan(idx);
       mqttPublishSpeed(idx);
     } else {
       safeStrcpy(f.name, sizeof(f.name), String(j.name));
@@ -1090,7 +1052,7 @@ static void sendJsonStatus(NetworkClient &c) {
   c.print(F("{\"rev\":")); c.print(g_stateRev);
   c.print(F(",\"device\":")); jsonPrintEscaped(c, deviceId.c_str());
   c.print(F(",\"ip\":")); jsonPrintEscaped(c, ethLocalIp().c_str());
-  c.print(F(",\"mqtt_connected\":")); c.print(mqtt.connected() ? "true" : "false");
+  c.print(F(",\"mqtt_connected\":")); c.print(mqtt.isConnected() ? "true" : "false");
   c.print(F(",\"boot_count\":")); c.print(g_bootCount);
   c.print(F(",\"safe_mode\":")); c.print(g_crashLoopDetected ? "true" : "false");
   c.print(F(",\"reset_reason\":")); jsonPrintEscaped(c, g_resetReasonStr.c_str());
@@ -1161,10 +1123,9 @@ static void commitIfPending() {
 // Log-Tail landet im NVS (zusaetzlich zum Shutdown-Handler).
 static void prepareRestart() {
   commitIfPending();
-  if (mqtt.connected()) {
-    String t = topicDev() + "/status";
-    mqtt.publish(t.c_str(), "offline", true);
-    mqtt.disconnect();
+  if (mqtt.isConnected()) {
+    mqtt.publish((topicDev() + "/status").c_str(), "offline", 0, true);
+    delay(50);   // dem MQTT-Task Zeit zum Senden geben (kein disconnect() in der Lib)
   }
   persistLogTail();
 }
@@ -1335,9 +1296,14 @@ static void apiMqttSave(NetworkClient &c, const String &body) {
   p.putString("pass",   mqttConfig.pass);
   p.putString("prefix", mqttConfig.prefix);
   p.end();
-  LOGI("MQTT", "config saved");
-  mqtt.disconnect();  // Reconnect mit neuer Konfig via Backoff
+  LOGI("MQTT", "config saved -> reboot");
   apiOk(c);
+  // esp-mqtt wird in setup() konfiguriert (kein sauberes Runtime-Reconfig) -> Neustart
+  // übernimmt die neue Konfig. Reboot ist rollback-sicher (Image ist valid).
+  c.flush();
+  prepareRestart();
+  delay(200);
+  esp_restart();
 }
 
 static void apiSafeModeReset(NetworkClient &c, const String &body) {
@@ -1475,7 +1441,6 @@ void setup() {
 
   loadConfigFans();
   loadMQTTConfig();
-  mqtt.setSocketTimeout(3);  // CONNACK-Busy-Wait < WDT-Budget (Spec §3.1)
   buildMacAndDeviceId();
   dutyPendingInit();
 
@@ -1504,6 +1469,21 @@ void setup() {
   feedLoopWDT();
   if (!ethBegin()) LOGE("NET", "ETH.begin failed");
   feedLoopWDT();
+
+  // [Stufe2/2] esp-mqtt zuletzt starten (Task läuft eigenständig, Auto-Reconnect; onMqttConnect
+  // feuert erst, wenn alles oben initialisiert ist). Nur wenn aktiviert + nicht im Safe-Mode.
+  // Client-ID/LWT-Topic in globalen Strings halten — die Lib speichert nur den Pointer.
+  if (mqttConfig.enabled && strlen(mqttConfig.host) > 0 && !g_crashLoopDetected) {
+    g_mqttClientId = deviceId + "-cli";
+    g_mqttLwtTopic = topicDev() + "/status";
+    mqtt.setMqttClientName(g_mqttClientId.c_str());
+    if (strlen(mqttConfig.user) > 0) mqtt.setURL(mqttConfig.host, mqttConfig.port, mqttConfig.user, mqttConfig.pass);
+    else                             mqtt.setURL(mqttConfig.host, mqttConfig.port);
+    mqtt.enableLastWillMessage(g_mqttLwtTopic.c_str(), "offline", true);
+    mqtt.setKeepAlive(30);
+    mqtt.loopStart();
+    LOGI("MQTT", String("esp-mqtt -> ") + mqttConfig.host + ":" + mqttConfig.port);
+  }
 
   LOGI("BOOT", "Setup complete.");
 }
@@ -1557,7 +1537,6 @@ void loop() {
     if (elapsed(now, g_linkLostSince, ETH_LINK_LOST_RESET_MS) && elapsed(now, g_lastEthReinit, ETH_REINIT_COOLDOWN_MS)) {
       LOGW("NET", "link down >15s -> ETH hard reset");
       g_lastEthReinit = now;
-      mqttWasConnected = false;
       httpUp = false;
       ethHardReset();
     }
@@ -1576,11 +1555,7 @@ void loop() {
     }
   }
 
-  // --- MQTT ---
-  if (mqttConfig.enabled && ethHasIP && !g_crashLoopDetected) {
-    mqttEnsureConnected();
-    if (mqtt.connected()) mqtt.loop();
-  }
+  // --- MQTT --- läuft im eigenen esp-mqtt-Task (loopStart in setup); nichts im Loop nötig.
 
   // --- Storm-Recovery ---
   for (uint8_t i = 0; i < MAX_FANS; i++) {
