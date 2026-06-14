@@ -8,6 +8,7 @@
 
 // --- Arduino autoproto fix ---
 #include <stdint.h>
+#include <atomic>   // §4.5: std::atomic fuer Cross-Core-Skalare (C11 _Atomic compiliert in C++/GCC nicht)
 enum FanFault : uint8_t;
 struct Fan;
 struct ApplyJob;
@@ -42,7 +43,7 @@ extern "C" {
 // (Definition NACH allen Includes — Arduino-Autoproto, siehe CLAUDE.md §4.)
 extern "C" bool verifyRollbackLater() { return true; }
 
-static bool g_otaPendingVerify = false;
+static std::atomic<bool> g_otaPendingVerify{false};
 static const uint32_t OTA_HEALTH_MS = 90000;
 
 // W5500-Board-Pins liegen jetzt in net_eth.h (ETH_PIN_*/ETH_SPI_*).
@@ -136,7 +137,7 @@ static String   gLogBuf, gPrevLogTail;
 static uint32_t g_bootCount = 0;
 static bool     g_crashLoopDetected = false;
 static String   g_resetReasonStr = "OTHER";
-static uint32_t g_minFreeHeap = UINT32_MAX;
+static std::atomic<uint32_t> g_minFreeHeap{UINT32_MAX};
 static String   deviceId;
 static uint8_t  g_mac[6];
 static uint8_t  g_crashStreak = 0;
@@ -368,7 +369,7 @@ static void fanAutoValidate(uint8_t idx) {
 }
 
 // ==== Globaler State ====
-static uint32_t g_stateRev = 0;
+static std::atomic<uint32_t> g_stateRev{0};
 
 // §4.3 (Spec): EIN Mutex schuetzt fans[]-Felder, die der esp-mqtt-Task liest, waehrend der
 // Loop-Task sie schreibt — plus die Pending-Cleanup-Liste. Disziplin: NIE ueber Socket-I/O
@@ -867,7 +868,7 @@ static void applyDo(uint8_t idx) {
     g_lastRpmSent[idx] = 0;
 
     rebuildPcntMap();
-    g_stateRev++;
+    g_stateRev.fetch_add(1);
     j.active = false;
     LOGI("APPLY", String("deleted idx=") + idx);
     return;
@@ -890,7 +891,7 @@ static void applyDo(uint8_t idx) {
     Preferences p; p.begin("fans", false);
     p.putString((String("f") + idx + "_name").c_str(), f.name);
     p.end();
-    g_stateRev++;
+    g_stateRev.fetch_add(1);
   }
 
   // Invert change
@@ -903,7 +904,7 @@ static void applyDo(uint8_t idx) {
     Preferences p; p.begin("fans", false);
     p.putUChar((String("f") + idx + "_inv").c_str(), f.invertPwm ? 1 : 0);
     p.end();
-    g_stateRev++;
+    g_stateRev.fetch_add(1);
   }
 
   // Pins changed
@@ -930,7 +931,7 @@ static void applyDo(uint8_t idx) {
     p.putUChar((k + "pwm").c_str(), f.pwmPin);
     p.putUChar((k + "tac").c_str(), f.tachPin);
     p.end();
-    g_stateRev++;
+    g_stateRev.fetch_add(1);
   }
 
   j.active = false;
@@ -1097,18 +1098,18 @@ static void handlePrevLogTxt(NetworkClient &c)  { httpSendHeaderOK(c, "text/plai
 // ==== JSON Status ====
 static void sendJsonStatus(NetworkClient &c) {
   httpSendHeaderOK(c, "application/json");
-  c.print(F("{\"rev\":")); c.print(g_stateRev);
+  c.print(F("{\"rev\":")); c.print(g_stateRev.load());
   c.print(F(",\"device\":")); jsonPrintEscaped(c, deviceId.c_str());
   c.print(F(",\"ip\":")); jsonPrintEscaped(c, ethLocalIp().c_str());
   c.print(F(",\"mqtt_connected\":")); c.print(mqtt.isConnected() ? "true" : "false");
   c.print(F(",\"boot_count\":")); c.print(g_bootCount);
   c.print(F(",\"safe_mode\":")); c.print(g_crashLoopDetected ? "true" : "false");
   c.print(F(",\"reset_reason\":")); jsonPrintEscaped(c, g_resetReasonStr.c_str());
-  c.print(F(",\"min_free_heap\":")); c.print(g_minFreeHeap);
+  c.print(F(",\"min_free_heap\":")); c.print(g_minFreeHeap.load());
   c.print(F(",\"largest_block\":")); c.print(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
   c.print(F(",\"uptime_s\":")); c.print((uint32_t)(esp_timer_get_time() / 1000000ULL));
   c.print(F(",\"wdt\":true"));
-  c.print(F(",\"ota_pending\":")); c.print(g_otaPendingVerify ? "true" : "false");
+  c.print(F(",\"ota_pending\":")); c.print(g_otaPendingVerify.load() ? "true" : "false");
   c.print(F(",\"crash_streak\":")); c.print((int)g_crashStreak);
   c.print(F(",\"mqtt\":{\"enabled\":")); c.print(mqttConfig.enabled ? "true" : "false");
   c.print(F(",\"host\":")); jsonPrintEscaped(c, mqttConfig.host);
@@ -1160,9 +1161,8 @@ static void sendJsonStatus(NetworkClient &c) {
 // NICHT: ein Image, das nicht bootet/haengt, erreicht diesen Pfad nie (bleibt PENDING
 // -> Rollback). Voraussetzung bleibt, dass der Safe-Mode HTTP+OTA am Leben haelt.
 static void commitIfPending() {
-  if (g_otaPendingVerify) {
+  if (g_otaPendingVerify.exchange(false)) {   // idempotent: Doppelaufruf ungefaehrlich
     esp_ota_mark_app_valid_cancel_rollback();
-    g_otaPendingVerify = false;
     LOGI("OTA", "Image als VALID markiert (bewusster Reboot/OTA aus laufendem Image)");
   }
 }
@@ -1474,7 +1474,7 @@ void setup() {
     esp_ota_img_states_t st;
     if (esp_ota_get_state_partition(running, &st) == ESP_OK &&
         st == ESP_OTA_IMG_PENDING_VERIFY) {
-      g_otaPendingVerify = true;
+      g_otaPendingVerify.store(true);
       LOGW("OTA", "Image PENDING_VERIFY - Health-Window 90s laeuft");
     }
   }
@@ -1546,7 +1546,7 @@ void loop() {
   // Netz-Umbau ist): ein Image, das KEINE IP bekommt, darf sich NICHT gueltig markieren
   // (sonst Soft-Brick: laeuft, aber unerreichbar). Bei "keine IP nach 120s" Selbst-Neustart
   // OHNE commit => Bootloader rollt auf v4.0 zurueck.
-  if (g_otaPendingVerify) {
+  if (g_otaPendingVerify.load()) {
     if (now > OTA_HEALTH_MS && ethHasIp()) {
       commitIfPending();
     } else if (now > 120000UL && !ethHasIp()) {
@@ -1558,7 +1558,7 @@ void loop() {
   }
 
   uint32_t hf = ESP.getFreeHeap();
-  if (hf < g_minFreeHeap) g_minFreeHeap = hf;
+  if (hf < g_minFreeHeap.load()) g_minFreeHeap.store(hf);
 
   // --- Apply-Queue ---
   if (g_anyApplyPending) {
