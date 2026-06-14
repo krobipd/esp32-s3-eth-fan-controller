@@ -51,6 +51,10 @@ static const uint32_t OTA_HEALTH_MS = 90000;
 
 // ==== Limits & Timing ====
 static const uint8_t  MAX_FANS              = 8;
+// §4.7: Arduino-loopTask laeuft auf Core 1 = Control-Core. ISR-/PCNT-/LEDC-Registrierung MUSS
+// von hier erfolgen (Affinitaet folgt dem Registrar), damit tachEdgeCore + Zaehler auf demselben
+// Core wie ihre Schreiber (fanSetDuty) liegen -> dann genuegt volatile (kein Mutex noetig).
+#define CONTROL_CORE 1
 static const uint32_t PWM_FREQ_HZ           = 25000;
 static const uint8_t  PWM_BITS              = 8;
 static const uint8_t  PULSES_PER_REV        = 2;
@@ -643,6 +647,7 @@ static bool enablePcntForFan(uint8_t idx, pcnt_unit_t unit) {
 }
 
 static void enableIsrForFan(uint8_t idx) {
+  if (xPortGetCoreID() != CONTROL_CORE) LOGE("AFFIN", String("ISR-Setup auf Core ") + xPortGetCoreID() + " (erwartet " + CONTROL_CORE + ")");  // §4.7
   Fan &f = fans[idx];
   if (canAttachInterruptPin(f.tachPin)) {
     attachInterrupt(digitalPinToInterrupt(f.tachPin), tachISRs[idx], FALLING);
@@ -664,6 +669,7 @@ static uint32_t pcntReadDeltaAndClear(uint8_t idx) {
 
 // ==== Deterministische PCNT-Zuweisung ====
 static void rebuildPcntMap() {
+  if (xPortGetCoreID() != CONTROL_CORE) LOGE("AFFIN", String("PCNT-Setup auf Core ") + xPortGetCoreID() + " (erwartet " + CONTROL_CORE + ")");  // §4.7
   for (uint8_t i = 0; i < MAX_FANS; i++) {
     if (!fanPresentIdx(i)) continue;
     fans[i].measureSuspended = true;
