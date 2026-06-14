@@ -22,6 +22,8 @@ struct DutyCmd { uint8_t idx; uint8_t duty; };
 
 static QueueHandle_t g_telemQ = nullptr;   // TelemetrySample, Core1 -> Core0
 static QueueHandle_t g_dutyQ  = nullptr;   // DutyCmd,         Core0 -> Core1
+static QueueHandle_t g_applyQ = nullptr;   // ApplyJob (by value), Core0 -> Core1.
+                                           // Erzeugung im Sketch (sizeof(ApplyJob) erst dort sichtbar).
 
 // Tiefen konservativ: 8 Luefter * wenige offene Events. Drop bei Voll ist tolerierbar
 // (RPM hat Keepalive; naechstes Sample ueberschreibt die Info) -> nie blockieren = WDT-sicher.

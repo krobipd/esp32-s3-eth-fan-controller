@@ -714,16 +714,16 @@ struct ApplyJob {
   bool     pinsChanged = false;
   bool     nameChanged = false;
   bool     invChanged  = false;
+  bool     calChanged  = false;        // §4.4: Calib ueber die Queue statt fans[]-Bypass in apiCalib
+  uint8_t  calMin      = 0;
+  char     calNote[40] = {0};
 };
 
-static ApplyJob g_apply[MAX_FANS];
-static bool     g_anyApplyPending = false;
-
+// §4.2: Apply-Job-Queue (by value) Core0->Core1, ersetzt g_apply[]/g_anyApplyPending.
 static void applyQueue(uint8_t idx, const ApplyJob &src) {
-  if (idx >= MAX_FANS) return;
-  g_apply[idx] = src;
-  g_apply[idx].active = true;
-  g_anyApplyPending = true;
+  if (idx >= MAX_FANS || !g_applyQ) return;
+  ApplyJob j = src; j.idx = idx; j.active = true;
+  xQueueSend(g_applyQ, &j, 0);   // Drop bei Voll (UI macht eine Aktion/Mal; Loop drained jeden Durchlauf)
   LOGI("APPLY", String("queued idx=") + idx + " del=" + (src.deleteFan ? "1" : "0") +
        " pins=" + (src.pinsChanged ? "1" : "0") + " name=" + (src.nameChanged ? "1" : "0"));
 }
@@ -840,10 +840,9 @@ void handleMQTT(void *handler_args, esp_event_base_t base, int32_t event_id, voi
 
 // ==== Apply-Worker ====
 // [B3] g_stateRev++ nur hier bei Strukturaenderungen
-static void applyDo(uint8_t idx) {
+static void applyDo(ApplyJob &j) {
+  uint8_t idx = j.idx;
   if (idx >= MAX_FANS) return;
-  ApplyJob &j = g_apply[idx];
-  if (!j.active) return;
 
   Fan &f = fans[idx];
 
@@ -877,7 +876,6 @@ static void applyDo(uint8_t idx) {
 
     rebuildPcntMap();
     g_stateRev.fetch_add(1);
-    j.active = false;
     LOGI("APPLY", String("deleted idx=") + idx);
     return;
   }
@@ -942,7 +940,20 @@ static void applyDo(uint8_t idx) {
     g_stateRev.fetch_add(1);
   }
 
-  j.active = false;
+  // Calib change (§4.4: ueber die Queue statt direktem fans[]-Write in apiCalib)
+  if (j.calChanged) {
+    fansLock();
+    fans[idx].calMinStart = j.calMin;
+    safeStrcpy(fans[idx].calNote, sizeof(fans[idx].calNote), String(j.calNote));
+    fansUnlock();
+    Preferences p; p.begin("fans", false);
+    String k = "f" + String(idx) + "_";
+    p.putUChar((k + "cmin").c_str(), j.calMin);
+    p.putString((k + "cnote").c_str(), j.calNote);
+    p.end();
+    g_stateRev.fetch_add(1);
+  }
+
   LOGI("APPLY", String("done idx=") + idx);
 }
 
@@ -1324,14 +1335,15 @@ static void apiCalib(NetworkClient &c, const String &body) {
   if (!formGet(body, F("idx"), s)) { apiErr(c, "missing idx"); return; }
   int idx = s.toInt();
   if (idx < 0 || idx >= MAX_FANS || !fanPresentIdx((uint8_t)idx)) { apiErr(c, "bad idx"); return; }
-  Fan &f = fans[idx];
-  if (formGet(body, F("cmin"), s)) f.calMinStart = dutyFromPct((uint8_t)constrain(s.toInt(), 0, 100));
-  if (formGet(body, F("cnote"), s)) safeStrcpy(f.calNote, sizeof(f.calNote), s);
-  Preferences p; p.begin("fans", false);
-  String k = "f" + String(idx) + "_";
-  p.putUChar((k + "cmin").c_str(), f.calMinStart);
-  p.putString((k + "cnote").c_str(), f.calNote);
-  p.end();
+  // §4.4: kein direkter fans[]-Write mehr — ueber die Apply-Queue an den Control-Core leiten.
+  ApplyJob j; j.idx = (uint8_t)idx; j.calChanged = true;
+  fansLock();                                  // Default = Ist-Wert (fehlt ein Feld, bleibt er erhalten)
+  j.calMin = fans[idx].calMinStart;
+  { uint8_t n = 0; for (; n < sizeof(j.calNote) - 1 && fans[idx].calNote[n]; n++) j.calNote[n] = fans[idx].calNote[n]; j.calNote[n] = 0; }
+  fansUnlock();
+  if (formGet(body, F("cmin"),  s)) j.calMin = dutyFromPct((uint8_t)constrain(s.toInt(), 0, 100));
+  if (formGet(body, F("cnote"), s)) safeStrcpy(j.calNote, sizeof(j.calNote), s);
+  applyQueue((uint8_t)idx, j);
   apiOk(c);
 }
 
@@ -1466,6 +1478,7 @@ void setup() {
   // §4: Cross-Core-Queues + fans[]-/Cleanup-Mutex VOR allem anderen anlegen (esp-mqtt-Task
   // startet erst mit loopStart() weiter unten; Log-Queue (spaeter) faengt ab hier alle LOGs).
   concurrencyInit();
+  g_applyQ = xQueueCreate(MAX_FANS, sizeof(ApplyJob));   // hier, da sizeof(ApplyJob) erst im Sketch sichtbar
   fansMutex = xSemaphoreCreateMutex();
 
   // Anti-Brick: Task-WDT bleibt AKTIV und ueberwacht den Loop-Task.
@@ -1571,16 +1584,8 @@ void loop() {
   if (hf < g_minFreeHeap.load()) g_minFreeHeap.store(hf);
 
   // --- Apply-Queue ---
-  if (g_anyApplyPending) {
-    bool stillPending = false;
-    for (uint8_t i = 0; i < MAX_FANS; i++) {
-      if (g_apply[i].active) {
-        applyDo(i);
-        if (g_apply[i].active) stillPending = true;
-      }
-    }
-    g_anyApplyPending = stillPending;
-  }
+  { ApplyJob j;
+    while (g_applyQ && xQueueReceive(g_applyQ, &j, 0) == pdTRUE) applyDo(j); }
 
   // --- Duty-Queue ---
   dutyProcessQueue();
