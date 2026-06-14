@@ -160,26 +160,43 @@ static inline const char *resetReasonStr(esp_reset_reason_t r) {
   }
 }
 
-static char g_logLineBuf[256];
+// §4.6: gLogBuf (Heap-String) wird von beiden Cores beruehrt -> Mutex. Producer (LOG-Makros)
+// posten in die Log-Queue (thread-safe, nie blockierend); EIN Consumer (logDrain) haengt an.
+static SemaphoreHandle_t logMutex = nullptr;
+static inline void logLock()   { if (logMutex) xSemaphoreTake(logMutex, portMAX_DELAY); }
+static inline void logUnlock() { if (logMutex) xSemaphoreGive(logMutex); }
 
+// Consumer-Seite: haengt eine Zeile an gLogBuf (mit Ringkuerzung). NUR via logDrain (ein Task).
 static void logLine(const char *s) {
   size_t slen = strlen(s);
+  logLock();
   if (gLogBuf.length() + slen + 1 > LOG_MAX) {
     int cut = (gLogBuf.length() + slen + 1) - LOG_MAX + 256;
     if (cut < (int)gLogBuf.length()) gLogBuf.remove(0, cut);
     else gLogBuf = "";
   }
   gLogBuf += s; gLogBuf += '\n';
-  Serial.println(s);
+  logUnlock();
 }
 
+// Producer-Seite (beide Cores): sofort auf Serial (Debug) + in die Log-Queue (gLogBuf via Consumer).
+// Lokaler Puffer statt geteiltem Static -> thread-safe ohne Lock im Hot-Path.
 static void logFmt(char level, const char *tag, const char *msg) {
+  char line[128];
   uint32_t ms = millis();
-  snprintf(g_logLineBuf, sizeof(g_logLineBuf),
+  snprintf(line, sizeof(line),
            "[T+%04lu.%03lus #%lu] [%c] %s: %s",
            (unsigned long)(ms / 1000UL), (unsigned long)(ms % 1000UL),
            (unsigned long)g_bootCount, level, tag, msg);
-  logLine(g_logLineBuf);
+  Serial.println(line);
+  logPost(line);
+}
+
+// Leert die Log-Queue in gLogBuf. NUR aus EINEM Task (Loop bis Task 8, dann networkTask).
+static void logDrain() {
+  if (!g_logQ) return;
+  LogLine l;
+  while (xQueueReceive(g_logQ, &l, 0) == pdTRUE) logLine(l.text);
 }
 
 #define LOGI(t, m) logFmt('I', t, (String(m)).c_str())
@@ -187,8 +204,10 @@ static void logFmt(char level, const char *tag, const char *msg) {
 #define LOGE(t, m) logFmt('E', t, (String(m)).c_str())
 
 static void persistLogTail() {
-  if (gLogBuf.isEmpty()) return;
+  logLock();                          // §4.6: gLogBuf-Snapshot unter Lock (Consumer haengt evtl. parallel an)
+  if (gLogBuf.isEmpty()) { logUnlock(); return; }
   String tail = gLogBuf;
+  logUnlock();
   if (tail.length() > (int)LOG_NVS_MAX) tail.remove(0, tail.length() - LOG_NVS_MAX);
   Preferences p; p.begin("sys", false);
   p.putString("log_tail", tail);
@@ -1111,7 +1130,7 @@ static void printChunked(NetworkClient &c, const char *s, size_t len) {
   }
 }
 
-static void handleLogTxt(NetworkClient &c)     { httpSendHeaderOK(c, "text/plain; charset=UTF-8"); printChunked(c, gLogBuf.c_str(), gLogBuf.length()); }
+static void handleLogTxt(NetworkClient &c)     { httpSendHeaderOK(c, "text/plain; charset=UTF-8"); logLock(); String snap = gLogBuf; logUnlock(); printChunked(c, snap.c_str(), snap.length()); }
 static void handlePrevLogTxt(NetworkClient &c)  { httpSendHeaderOK(c, "text/plain; charset=UTF-8"); printChunked(c, gPrevLogTail.c_str(), gPrevLogTail.length()); }
 
 // ==== JSON Status ====
@@ -1480,6 +1499,7 @@ void setup() {
   concurrencyInit();
   g_applyQ = xQueueCreate(MAX_FANS, sizeof(ApplyJob));   // hier, da sizeof(ApplyJob) erst im Sketch sichtbar
   fansMutex = xSemaphoreCreateMutex();
+  logMutex  = xSemaphoreCreateMutex();
 
   // Anti-Brick: Task-WDT bleibt AKTIV und ueberwacht den Loop-Task.
   // 8 s Budget; Panic => Reboot => ggf. Bootloader-Rollback (Spec §3.1/3.2).
@@ -1558,6 +1578,7 @@ void setup() {
   }
 
   LOGI("BOOT", "Setup complete.");
+  logDrain();   // §4.6: Setup-Log-Burst aus der Queue in gLogBuf flushen
 }
 
 // ==== loop() ====
@@ -1706,8 +1727,9 @@ void loop() {
   // --- Duty-State persistieren ---
   stateFlushIfNeeded(now);
 
-  // --- Telemetrie -> MQTT (vorlaeufig im Loop; Task 8 verschiebt das in den networkTask) ---
+  // --- Telemetrie + Log -> Senken (vorlaeufig im Loop; Task 8 verschiebt das in den networkTask) ---
   telemDrain();
+  logDrain();
 
   // --- Log-Tail persistieren ---
   static uint32_t lastLogFlush = 0;
