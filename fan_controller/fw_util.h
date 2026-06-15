@@ -25,7 +25,7 @@ static inline bool fanNameValid(const char *s) {
     if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '-'))
       return false;
   }
-  if (strcmp(s, "status") == 0 || strcmp(s, "sys") == 0) return false;
+  if (strcmp(s, "status") == 0 || strcmp(s, "sys") == 0 || strcmp(s, "info") == 0) return false;  // Geraete-Namespaces
   return true;
 }
 

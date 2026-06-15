@@ -1,5 +1,5 @@
 /**************************************************************
- * WAVESHARE ESP32-S3-ETH Fan Controller v5.0.0 (Dual-Core: native ETH.h + esp-mqtt + Core-Split)
+ * WAVESHARE ESP32-S3-ETH Fan Controller v5.1.0 (Dual-Core + MQTT-Geraete-Info unter info/)
  * Version = FW_VERSION (einzige Quelle der Wahrheit, weiter unten) — Banner/UI/API lesen daraus.
  * Board: Waveshare ESP32-S3-ETH (W5500 via SPI2, PoE)
  * Arduino IDE 2.3.7 | ESP32 Arduino Core 3.3.8
@@ -53,7 +53,7 @@ static const uint32_t OTA_HEALTH_MS = 90000;
 // ==== Limits & Timing ====
 // ==== Version (Semver, EINZIGE Quelle der Wahrheit) ====
 // Bumpen + git-Tag vX.Y.Z müssen zusammenpassen. MAJOR=Architektur/Breaking, MINOR=Feature, PATCH=Fix.
-#define FW_VERSION "5.0.0"
+#define FW_VERSION "5.1.0"
 
 static const uint8_t  MAX_FANS              = 8;
 // §4.7: Arduino-loopTask laeuft auf Core 1 = Control-Core. ISR-/PCNT-/LEDC-Registrierung MUSS
@@ -849,7 +849,11 @@ static void mqttSubscribeFan(uint8_t i) {
 // Von esp-mqtt bei (Re-)Connect aufgerufen (MQTT-Task-Kontext): online melden, abonnieren, Ist publishen.
 void onMqttConnect(esp_mqtt_client_handle_t client) {
   if (!mqtt.isMyTurn(client)) return;
-  mqtt.publish((topicDev() + "/status").c_str(), "online", 0, true);
+  // Geraete-Info unter info/ (retained): status (LWT), Firmware-Version, aktuelle IP.
+  String dev = topicDev();
+  mqtt.publish((dev + "/info/status").c_str(),  "online",            0, true);
+  mqtt.publish((dev + "/info/version").c_str(), FW_VERSION,          0, true);
+  mqtt.publish((dev + "/info/ip").c_str(),      ethLocalIp().c_str(), 0, true);
   // §18: ZUERST verwaiste retained Topics aus der Disconnect-Phase raeumen (snapshot-then-send) —
   // vor dem present-Loop, damit ein im selben Slot neu angelegter, gleichnamiger Luefter zuletzt
   // gewinnt (Subscribe/Publish nicht versehentlich vom Cleanup ueberschrieben).
@@ -1246,7 +1250,7 @@ static void commitIfPending() {
 static void prepareRestart() {
   commitIfPending();
   if (mqtt.isConnected()) {
-    mqtt.publish((topicDev() + "/status").c_str(), "offline", 0, true);
+    mqtt.publish((topicDev() + "/info/status").c_str(), "offline", 0, true);
     delay(50);   // dem MQTT-Task Zeit zum Senden geben (kein disconnect() in der Lib)
   }
   persistLogTail();
@@ -1655,7 +1659,7 @@ void setup() {
   // Client-ID/LWT-Topic in globalen Strings halten — die Lib speichert nur den Pointer.
   if (mqttConfig.enabled && strlen(mqttConfig.host) > 0 && !g_crashLoopDetected) {
     g_mqttClientId = deviceId + "-cli";
-    g_mqttLwtTopic = topicDev() + "/status";
+    g_mqttLwtTopic = topicDev() + "/info/status";
     mqtt.setMqttClientName(g_mqttClientId.c_str());
     if (strlen(mqttConfig.user) > 0) mqtt.setURL(mqttConfig.host, mqttConfig.port, mqttConfig.user, mqttConfig.pass);
     else                             mqtt.setURL(mqttConfig.host, mqttConfig.port);
