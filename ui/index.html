@@ -1,9 +1,15 @@
 <!doctype html><html lang="de"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>FAN-CTRL</title>
+<script>document.documentElement.dataset.theme=localStorage.getItem("theme")||(matchMedia("(prefers-color-scheme:light)").matches?"light":"dark");</script>
 <style>
 :root{--bg:#0a0e12;--panel:#0f141b;--bd:#1f2937;--fg:#e2e8f0;--mut:#64748b;--dim:#475569;
---ok:#22c55e;--warn:#f59e0b;--err:#ef4444;--acc:#38bdf8}
+--ok:#22c55e;--warn:#f59e0b;--err:#ef4444;--acc:#38bdf8;
+--btn:#16202e;--danger:#2b1515;--bok:#a7f3d0;--bwarn:#fde68a;--berr:#fecaca}
+:root[data-theme=light]{--bg:#eef2f6;--panel:#ffffff;--bd:#cbd5e1;--fg:#1e293b;--mut:#64748b;--dim:#94a3b8;
+--ok:#16a34a;--warn:#d97706;--err:#dc2626;--acc:#0284c7;
+--btn:#e2e8f0;--danger:#fee2e2;--bok:#15803d;--bwarn:#b45309;--berr:#b91c1c}
+html{color-scheme:dark light}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--fg);
 font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:14px}
@@ -23,12 +29,12 @@ main{background:var(--panel);border:1px solid var(--bd);border-radius:0 6px 6px 
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:10px}
 .fan{background:var(--bg);border:1px solid var(--bd);border-left:3px solid var(--ok);border-radius:6px;padding:10px}
 .fan.f3{border-left-color:var(--warn)}.fan.f4,.fan.bad{border-left-color:var(--err)}
-.fan .top{display:flex;justify-content:space-between;font-size:11px;color:#94a3b8}
+.fan .top{display:flex;justify-content:space-between;font-size:11px;color:var(--mut)}
 .fan .rpm{font-size:26px;font-weight:700;margin:4px 0}.fan .rpm small{font-size:11px;color:var(--dim)}
 .fan input[type=range]{width:100%;accent-color:var(--acc)}
 .fan .pct{font-size:11px;color:var(--mut)}
 .badge{font-size:10px;padding:1px 7px;border-radius:8px;border:1px solid var(--bd)}
-.b-ok{color:#a7f3d0}.b-warn{color:#fde68a}.b-err{color:#fecaca}
+.b-ok{color:var(--bok)}.b-warn{color:var(--bwarn)}.b-err{color:var(--berr)}
 .kv{display:grid;grid-template-columns:max-content 1fr;gap:6px 18px;font-size:13px}
 .kv b{color:var(--mut);font-weight:400}
 pre{background:var(--bg);border:1px solid var(--bd);border-radius:6px;padding:10px;
@@ -37,8 +43,8 @@ label{display:block;color:var(--mut);font-size:11px;margin:10px 0 3px;letter-spa
 input[type=text],input[type=password],input[type=number],select{width:100%;max-width:340px;
 font:inherit;padding:7px;background:var(--bg);border:1px solid var(--bd);border-radius:6px;color:var(--fg)}
 .btn{font:inherit;font-size:12px;padding:7px 14px;border:1px solid var(--bd);border-radius:6px;
-background:#16202e;color:var(--fg);cursor:pointer;margin:10px 6px 0 0}
-.btn.danger{background:#2b1515;border-color:#4b1b1b}
+background:var(--btn);color:var(--fg);cursor:pointer;margin:10px 6px 0 0}
+.btn.danger{background:var(--danger);border-color:var(--err)}
 .row{display:flex;gap:16px;flex-wrap:wrap}.col{flex:1;min-width:260px}
 .list{border:1px solid var(--bd);border-radius:6px;margin-top:8px}
 .list>div{display:flex;justify-content:space-between;align-items:center;padding:8px 10px;border-bottom:1px solid var(--bd)}
@@ -46,14 +52,16 @@ background:#16202e;color:var(--fg);cursor:pointer;margin:10px 6px 0 0}
 .muted{color:var(--mut)}.small{font-size:11px}
 progress{width:100%;accent-color:var(--acc)}
 hr{border:0;border-top:1px solid var(--bd);margin:16px 0}
-#toast{position:fixed;bottom:16px;right:16px;background:#16202e;border:1px solid var(--bd);
+#toast{position:fixed;bottom:16px;right:16px;background:var(--btn);border:1px solid var(--bd);
 border-radius:6px;padding:10px 14px;display:none;font-size:12px}
+#themebtn{font:inherit;font-size:13px;line-height:1;cursor:pointer;background:none;border:1px solid var(--bd);border-radius:6px;color:var(--mut);padding:3px 9px}
 </style></head><body><div class="wrap">
 <header>
   <h1>FAN-CTRL <small id="ver">—</small> <small id="dev">—</small></h1>
   <div class="leds">
     <span class="led" id="l-eth">ETH</span><span class="led" id="l-mqtt">MQTT</span>
     <span class="led" id="l-wdt">WDT</span><span id="l-ip" class="muted"></span>
+    <button id="themebtn" onclick="toggleTheme()" title="Hell/Dunkel umschalten">☀</button>
   </div>
 </header>
 <div id="safebanner">⚠ SAFE MODE — Crash-Loop erkannt. Lüfter laufen mit 70 % Failsafe, MQTT ist aus.</div>
@@ -210,5 +218,9 @@ function poll(force){return fetch("/api/status",{cache:"no-store"}).then(r=>r.js
   $("safebanner").style.display=j.safe_mode?"":"none";
   renderDash();renderSys();if(force||$("t-cfg").style.display==="")renderCfg();})
  .catch(()=>{if(++fail>=3){$("l-eth").classList.remove("on");$("l-mqtt").classList.remove("on");}});}
+function syncThemeBtn(){var b=$("themebtn");if(b)b.textContent=document.documentElement.dataset.theme==="light"?"☾":"☀";}
+function toggleTheme(){var t=document.documentElement.dataset.theme==="light"?"dark":"light";localStorage.setItem("theme",t);document.documentElement.dataset.theme=t;syncThemeBtn();}
+matchMedia("(prefers-color-scheme:light)").addEventListener("change",function(e){if(!localStorage.getItem("theme")){document.documentElement.dataset.theme=e.matches?"light":"dark";syncThemeBtn();}});
+syncThemeBtn();
 setInterval(poll,1500);poll(true);
 </script></div></body></html>
