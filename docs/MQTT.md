@@ -6,20 +6,26 @@ Das Gerät verbindet sich als Client zu einem MQTT-Broker (Konfiguration im Web-
 
 ## Topic-Schema
 
-Flach, pro Lüfter genau drei Datenpunkte direkt unter dem (klein geschriebenen) Lüfternamen:
+Flach: Geräte-Info unter `info/`, pro Lüfter drei Datenpunkte unter dem (klein geschriebenen) Lüfternamen:
 
 ```
-<prefix>/<deviceId>/status            online / offline   (retained, Last-Will)
+<prefix>/<deviceId>/info/status        online / offline        (retained, Last-Will)
+<prefix>/<deviceId>/info/version       Firmware-Version (z. B. 5.2.0)   (retained)
+<prefix>/<deviceId>/info/ip            aktuelle IP-Adresse     (retained)
 <prefix>/<deviceId>/<fan>/speed        Ist-Stellwert 0–100 %   (retained)
 <prefix>/<deviceId>/<fan>/set          Befehl 0–100            (kein Retain)
 <prefix>/<deviceId>/<fan>/rpm          Drehzahl
 ```
 
+`status`, `sys` und `info` sind als Lüfternamen reserviert (kollidieren nicht mit `info/`).
+
 Beispiel (prefix `esp`, Lüfter `nas`):
 
 | Topic | Richtung | Wert |
 |---|---|---|
-| `esp/ws-s3eth-1A2B3C/status` | Gerät → Broker | `online` (retained), `offline` (Last-Will) |
+| `esp/ws-s3eth-1A2B3C/info/status` | Gerät → Broker | `online` (retained), `offline` (Last-Will) |
+| `esp/ws-s3eth-1A2B3C/info/version` | Gerät → Broker | z. B. `5.2.0` (retained) |
+| `esp/ws-s3eth-1A2B3C/info/ip` | Gerät → Broker | z. B. `10.0.0.42` (retained) |
 | `esp/ws-s3eth-1A2B3C/nas/speed` | Gerät → Broker | z. B. `58` (Ist-%, retained) |
 | `esp/ws-s3eth-1A2B3C/nas/rpm` | Gerät → Broker | z. B. `864` |
 | `esp/ws-s3eth-1A2B3C/nas/set` | Broker → Gerät | `0`–`100` (Sollwert in %) |
@@ -35,7 +41,7 @@ Wichtig:
 ## Beispiel: ioBroker
 
 Der MQTT-Adapter (Broker- oder Client-Modus) legt eingehende Topics **automatisch** als
-Objekte an — für `speed`/`rpm`/`status` ist also nichts zu konfigurieren. Aus
+Objekte an — für `info/*` und `speed`/`rpm` ist also nichts zu konfigurieren. Aus
 `esp/ws-s3eth-1A2B3C/nas/speed` wird das Objekt:
 
 ```
@@ -52,6 +58,21 @@ Damit der Adapter diesen Wert auch wirklich an den Broker published, muss er fü
 States auf Änderung publishen (Standard im Broker-Modus). Schnelltest, dass der Befehl
 ankommt: das Gerät loggt jeden empfangenen Befehl (Web-UI → System → Log:
 `MQTT: set nas -> 60%`).
+
+## Home Assistant (optional, default aus)
+
+Für Nutzer mit Home Assistant: der Schalter **Einstellungen → MQTT → Home-Assistant-Discovery**
+lässt das Gerät pro Lüfter zwei retained Discovery-Config-Topics publishen, damit HA die Entitäten
+automatisch anlegt (Discovery-Prefix fest `homeassistant`):
+
+- `homeassistant/number/<deviceId>/<fan>/config` — Sollwert 0–100 % als Slider
+  (`command_topic`=`…/<fan>/set`, `state_topic`=`…/<fan>/speed`, `min:0`/`max:100`)
+- `homeassistant/sensor/<deviceId>/<fan>_rpm/config` — Drehzahl (RPM)
+
+Alle Entitäten teilen einen `device`-Block (Gruppierung als ein Gerät in HA) und nutzen
+`availability_topic`=`…/info/status` (online/offline). Beim Umbenennen/Löschen eines Lüfters oder
+Ausschalten der Option werden die Config-Topics geleert → keine Geister-Entitäten. Für **ioBroker**-Nutzer
+ist die Option irrelevant — die `homeassistant/…`-Topics werden dort einfach ignoriert.
 
 > Wechselt man von einem älteren, anders strukturierten Schema, muss die eigene Logik
 > (Skripte/Visualisierung) auf die neuen Objekt-IDs und die 0–100-Skala umgezogen werden —

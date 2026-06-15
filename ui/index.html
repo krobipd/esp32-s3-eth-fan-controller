@@ -107,8 +107,9 @@ border-radius:6px;padding:10px 14px;display:none;font-size:12px}
       <label>USER</label><input type="text" id="m-user">
       <label>PASSWORT</label><input type="password" id="m-pass" placeholder="(unverändert lassen = leer)">
       <label>PREFIX</label><input type="text" id="m-prefix" maxlength="15">
+      <label style="margin-top:12px"><input type="checkbox" id="m-ha" style="width:auto"> Home-Assistant-Discovery (für andere; default aus)</label>
       <button class="btn" onclick="saveMqtt()">MQTT speichern</button>
-      <p class="muted small">Topics: prefix/&lt;device&gt;/&lt;name&gt;/speed·set·rpm + …/status</p></div>
+      <p class="muted small">Topics: prefix/&lt;device&gt;/&lt;name&gt;/speed·set·rpm + …/info/status·version·ip</p></div>
   </div></section>
 
   <section id="t-fw" style="display:none">
@@ -171,7 +172,7 @@ function renderCfg(){const l=$("fanlist");l.innerHTML="";const fans=J.fans||[];
   b.onclick=()=>editFan(f.index);d.appendChild(b);
   l.appendChild(d);});
  if(!mqttLoaded&&J.mqtt){mqttLoaded=true;$("m-en").checked=!!J.mqtt.enabled;$("m-host").value=J.mqtt.host||"";
-  $("m-port").value=J.mqtt.port||1883;$("m-user").value=J.mqtt.user||"";$("m-prefix").value=J.mqtt.prefix||"esp";}}
+  $("m-port").value=J.mqtt.port||1883;$("m-user").value=J.mqtt.user||"";$("m-prefix").value=J.mqtt.prefix||"esp";$("m-ha").checked=!!J.mqtt.hadisc;}}
 function pinOpts(sel,list,current){sel.innerHTML="";[...new Set([current,...list])].filter(p=>p!==undefined&&p!==255)
  .forEach(p=>{const o=document.createElement("option");o.value=p;o.textContent="GPIO "+p;
   if(p===current)o.selected=true;sel.appendChild(o);});}
@@ -191,7 +192,7 @@ function delFan(){if(confirm("Lüfter wirklich löschen?"))
  api("/api/fan/delete",{idx:editIdx},()=>{$("editbox").style.display="none";toast("Gelöscht");poll(true);});}
 function saveCalib(){api("/api/calib",{idx:editIdx,cmin:$("e-cmin").value,cnote:$("e-note").value},()=>toast("Kalibrierung gespeichert"));}
 function saveMqtt(){api("/api/mqtt",{enabled:$("m-en").checked?1:0,host:$("m-host").value,port:$("m-port").value,
- user:$("m-user").value,pass:$("m-pass").value,prefix:$("m-prefix").value},()=>toast("MQTT gespeichert"));}
+ user:$("m-user").value,pass:$("m-pass").value,prefix:$("m-prefix").value,hadisc:$("m-ha").checked?1:0},()=>toast("MQTT gespeichert"));}
 function loadLogs(){fetch("/log.txt").then(r=>r.text()).then(t=>$("log").textContent=t.split("\n").slice(-300).join("\n"));
  fetch("/prevlog.txt").then(r=>r.text()).then(t=>$("prevlog").textContent=t);}
 function flash(){const f=$("fwfile").files[0];if(!f){toast("Bitte .bin wählen");return;}

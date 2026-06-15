@@ -63,12 +63,13 @@ Strapping/Boot 0/3/45/46 · intern (Flash/PSRAM-Bus) 33–37 nur bei `PSRAM=disa
 - **LEDC (PWM):** 8 Kanäle → exakt 8 Lüfter möglich. PWM 25 kHz / 8-bit.
 - **PCNT (Hardware-Pulszähler):** 4 Units → die ersten 4 Lüfter werden HW-gezählt,
   der Rest per ISR (mit Glitch-Filter). Tacho: 2 Pulse/Umdrehung.
-- 2 CPU-Cores (Stufe 1 nutzt einen; Dual-Core-Trennung ist Stufe-2-Thema).
+- 2 CPU-Cores: Netz/HTTP/MQTT laufen auf Core 0, der Steuer-/Mess-Loop (RPM/PWM/Persistenz)
+  auf Core 1 (Dual-Core-Split mit FreeRTOS-Queues + Mutex).
 
 ## Libraries
 
-`Ethernet` (W5500) · `PubSubClient` (MQTT) · `Update` (OTA) · `Preferences` (NVS) · `SPI`
-+ ESP-IDF (`driver/pcnt`, `esp_ota_ops`, `esp_task_wdt`).
+nativer `ETH.h` (W5500 via esp-netif/lwIP) · `ESP32MQTTClient` / esp-mqtt (thread-safe, eigener Task) ·
+`Update` (OTA) · `Preferences` (NVS) · `SPI` + ESP-IDF (`driver/pcnt`, `esp_ota_ops`, `esp_task_wdt`).
 
 ## OTA & Anti-Brick (Kurzfassung)
 

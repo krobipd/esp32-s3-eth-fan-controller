@@ -1,6 +1,7 @@
 #pragma once
 #include <stdint.h>
 #include <string.h>
+#include <string>
 
 // Wrap-sicherer Zeitvergleich: true sobald intervalMs seit 'since' vergangen.
 // IMMER statt `millis() < deadline` verwenden (49,7-Tage-Wrap!).
@@ -52,3 +53,30 @@ static inline bool pendingCleanupAdd(PendingCleanup &pc, const char *name) {
   return true;
 }
 static inline void pendingCleanupClear(PendingCleanup &pc) { pc.count = 0; }
+
+// §5.5 Home-Assistant-MQTT-Discovery — Config-JSON (pure, host-getestet).
+// Entitaeten: number (Sollwert 0-100 %) + sensor (RPM). Geteilter device-Block gruppiert alle
+// Entitaeten eines Geraets. Abgekuerzte HA-Keys (uniq_id/cmd_t/stat_t/avty_t/dev) = kleinere Payloads.
+static inline std::string haDeviceBlock(const std::string &dev, const std::string &fwver) {
+  return "\"dev\":{\"ids\":[\"" + dev + "\"],\"name\":\"Fan Controller " + dev +
+         "\",\"mf\":\"DIY (Waveshare ESP32-S3-ETH)\",\"mdl\":\"ESP32-S3-ETH Fan Controller\",\"sw\":\"" + fwver + "\"}";
+}
+// number: Sollwert. min:0 EXPLIZIT (HA-Default waere 1). avty_t = info/status (online/offline).
+static inline std::string haNumberConfig(const std::string &prefix, const std::string &dev,
+                                         const std::string &fan, const std::string &fwver) {
+  std::string base = prefix + "/" + dev + "/" + fan;
+  return "{\"name\":\"" + fan + "\",\"uniq_id\":\"" + dev + "_" + fan + "_set\","
+         "\"cmd_t\":\"" + base + "/set\",\"stat_t\":\"" + base + "/speed\","
+         "\"min\":0,\"max\":100,\"step\":1,\"mode\":\"slider\",\"unit_of_meas\":\"%\","
+         "\"avty_t\":\"" + prefix + "/" + dev + "/info/status\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\","
+         + haDeviceBlock(dev, fwver) + "}";
+}
+// sensor: Drehzahl (RPM). Eigene unique_id (Pflicht).
+static inline std::string haSensorConfig(const std::string &prefix, const std::string &dev,
+                                         const std::string &fan, const std::string &fwver) {
+  std::string base = prefix + "/" + dev + "/" + fan;
+  return "{\"name\":\"" + fan + " RPM\",\"uniq_id\":\"" + dev + "_" + fan + "_rpm\","
+         "\"stat_t\":\"" + base + "/rpm\",\"unit_of_meas\":\"RPM\","
+         "\"avty_t\":\"" + prefix + "/" + dev + "/info/status\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\","
+         + haDeviceBlock(dev, fwver) + "}";
+}
