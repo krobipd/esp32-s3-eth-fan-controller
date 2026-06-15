@@ -1,5 +1,6 @@
 /**************************************************************
- * WAVESHARE ESP32-S3-ETH Fan Controller v5.0 (Dual-Core: native ETH.h + esp-mqtt + Core-Split)
+ * WAVESHARE ESP32-S3-ETH Fan Controller v5.0.0 (Dual-Core: native ETH.h + esp-mqtt + Core-Split)
+ * Version = FW_VERSION (einzige Quelle der Wahrheit, weiter unten) — Banner/UI/API lesen daraus.
  * Board: Waveshare ESP32-S3-ETH (W5500 via SPI2, PoE)
  * Arduino IDE 2.3.7 | ESP32 Arduino Core 3.3.8
  * W5500 Pins: MISO=12, MOSI=11, SCLK=13, CS=14, RST=9
@@ -50,6 +51,10 @@ static const uint32_t OTA_HEALTH_MS = 90000;
 // W5500-Board-Pins liegen jetzt in net_eth.h (ETH_PIN_*/ETH_SPI_*).
 
 // ==== Limits & Timing ====
+// ==== Version (Semver, EINZIGE Quelle der Wahrheit) ====
+// Bumpen + git-Tag vX.Y.Z müssen zusammenpassen. MAJOR=Architektur/Breaking, MINOR=Feature, PATCH=Fix.
+#define FW_VERSION "5.0.0"
+
 static const uint8_t  MAX_FANS              = 8;
 // §4.7: Arduino-loopTask laeuft auf Core 1 = Control-Core. ISR-/PCNT-/LEDC-Registrierung MUSS
 // von hier erfolgen (Affinitaet folgt dem Registrar), damit tachEdgeCore + Zaehler auf demselben
@@ -1149,6 +1154,7 @@ static void handlePrevLogTxt(NetworkClient &c)  { httpSendHeaderOK(c, "text/plai
 static void sendJsonStatus(NetworkClient &c) {
   httpSendHeaderOK(c, "application/json");
   c.print(F("{\"rev\":")); c.print(g_stateRev.load());
+  c.print(F(",\"fw_version\":")); jsonPrintEscaped(c, FW_VERSION);
   c.print(F(",\"device\":")); jsonPrintEscaped(c, deviceId.c_str());
   c.print(F(",\"ip\":")); jsonPrintEscaped(c, ethLocalIp().c_str());
   c.print(F(",\"mqtt_connected\":")); c.print(mqtt.isConnected() ? "true" : "false");
@@ -1574,7 +1580,7 @@ static void networkTask(void *arg) {
 void setup() {
   Serial.begin(115200);
   delay(200);
-  Serial.println(F("== ESP32-S3-ETH Fan Controller v5.0 =="));
+  Serial.println(F("== ESP32-S3-ETH Fan Controller v" FW_VERSION " =="));
 
   // §4: Cross-Core-Queues + fans[]-/Cleanup-Mutex VOR allem anderen anlegen (esp-mqtt-Task
   // startet erst mit loopStart() weiter unten; Log-Queue (spaeter) faengt ab hier alle LOGs).

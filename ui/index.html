@@ -50,7 +50,7 @@ hr{border:0;border-top:1px solid var(--bd);margin:16px 0}
 border-radius:6px;padding:10px 14px;display:none;font-size:12px}
 </style></head><body><div class="wrap">
 <header>
-  <h1>FAN-CTRL <small id="dev">—</small></h1>
+  <h1>FAN-CTRL <small id="ver">—</small> <small id="dev">—</small></h1>
   <div class="leds">
     <span class="led" id="l-eth">ETH</span><span class="led" id="l-mqtt">MQTT</span>
     <span class="led" id="l-wdt">WDT</span><span id="l-ip" class="muted"></span>
@@ -147,7 +147,7 @@ function renderDash(){const g=$("fangrid");const fans=(J.fans||[]).filter(f=>f.p
   if(sl&&document.activeElement!==sl){sl.value=f.pct;const p=$("p"+f.index);if(p)p.textContent=f.pct;}});}
 function renderSys(){const fmt=s=>{const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);
   return(d?d+"d ":"")+h+"h "+m+"m"};
- $("syskv").innerHTML=[["Device",esc(J.device)],["IP",esc(J.ip)],["Uptime",fmt(J.uptime_s||0)],
+ $("syskv").innerHTML=[["Firmware","v"+esc(J.fw_version||"?")],["Device",esc(J.device)],["IP",esc(J.ip)],["Uptime",fmt(J.uptime_s||0)],
   ["Boot-Count",J.boot_count],["Reset-Grund",esc(J.reset_reason)],["Crash-Streak",J.crash_streak],
   ["Watchdog",J.wdt?"AKTIV":"AUS!"],["OTA",J.ota_pending?"PENDING_VERIFY (Health-Window)":"validiert"],
   ["Min Free Heap",J.min_free_heap],["Largest Block",J.largest_block]]
@@ -206,7 +206,7 @@ function watchReboot(){const b0=J?J.boot_count:0,t0=Date.now();
 function poll(force){return fetch("/api/status",{cache:"no-store"}).then(r=>r.json()).then(j=>{
   J=j;fail=0;$("l-eth").classList.add("on");
   $("l-mqtt").classList.toggle("on",!!j.mqtt_connected);$("l-wdt").classList.toggle("on",!!j.wdt);
-  $("dev").textContent=j.device||"—";$("l-ip").textContent=j.ip||"";
+  $("dev").textContent=j.device||"—";$("ver").textContent=j.fw_version?("v"+j.fw_version):"";$("l-ip").textContent=j.ip||"";
   $("safebanner").style.display=j.safe_mode?"":"none";
   renderDash();renderSys();if(force||$("t-cfg").style.display==="")renderCfg();})
  .catch(()=>{if(++fail>=3){$("l-eth").classList.remove("on");$("l-mqtt").classList.remove("on");}});}
