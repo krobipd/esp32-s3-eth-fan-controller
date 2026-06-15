@@ -37,6 +37,19 @@ int main() {
   pendingCleanupClear(pc);
   assert(pc.count == 0);
 
+  // §5.5 HA-Discovery Config-JSON
+  std::string num = haNumberConfig("esp", "ws-s3eth-97BACC", "nas", "5.3.0");
+  assert(num.find("\"min\":0") != std::string::npos);                                  // min explizit 0
+  assert(num.find("\"cmd_t\":\"esp/ws-s3eth-97BACC/nas/set\"") != std::string::npos);
+  assert(num.find("\"stat_t\":\"esp/ws-s3eth-97BACC/nas/speed\"") != std::string::npos);
+  assert(num.find("\"avty_t\":\"esp/ws-s3eth-97BACC/info/status\"") != std::string::npos);
+  assert(num.find("\"uniq_id\":\"ws-s3eth-97BACC_nas_set\"") != std::string::npos);
+  assert(num.find("\"sw\":\"5.3.0\"") != std::string::npos);
+  std::string sen = haSensorConfig("esp", "ws-s3eth-97BACC", "nas", "5.3.0");
+  assert(sen.find("\"stat_t\":\"esp/ws-s3eth-97BACC/nas/rpm\"") != std::string::npos);
+  assert(sen.find("\"unit_of_meas\":\"RPM\"") != std::string::npos);
+  assert(sen.find("\"uniq_id\":\"ws-s3eth-97BACC_nas_rpm\"") != std::string::npos);     // eigene uniq_id
+
   puts("OK");
   return 0;
 }

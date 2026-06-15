@@ -59,6 +59,21 @@ States auf Änderung publishen (Standard im Broker-Modus). Schnelltest, dass der
 ankommt: das Gerät loggt jeden empfangenen Befehl (Web-UI → System → Log:
 `MQTT: set nas -> 60%`).
 
+## Home Assistant (optional, default aus)
+
+Für Nutzer mit Home Assistant: der Schalter **Einstellungen → MQTT → Home-Assistant-Discovery**
+lässt das Gerät pro Lüfter zwei retained Discovery-Config-Topics publishen, damit HA die Entitäten
+automatisch anlegt (Discovery-Prefix fest `homeassistant`):
+
+- `homeassistant/number/<deviceId>/<fan>/config` — Sollwert 0–100 % als Slider
+  (`command_topic`=`…/<fan>/set`, `state_topic`=`…/<fan>/speed`, `min:0`/`max:100`)
+- `homeassistant/sensor/<deviceId>/<fan>_rpm/config` — Drehzahl (RPM)
+
+Alle Entitäten teilen einen `device`-Block (Gruppierung als ein Gerät in HA) und nutzen
+`availability_topic`=`…/info/status` (online/offline). Beim Umbenennen/Löschen eines Lüfters oder
+Ausschalten der Option werden die Config-Topics geleert → keine Geister-Entitäten. Für **ioBroker**-Nutzer
+ist die Option irrelevant — die `homeassistant/…`-Topics werden dort einfach ignoriert.
+
 > Wechselt man von einem älteren, anders strukturierten Schema, muss die eigene Logik
 > (Skripte/Visualisierung) auf die neuen Objekt-IDs und die 0–100-Skala umgezogen werden —
 > das ist Sache der jeweiligen Home-Automation, nicht der Firmware.

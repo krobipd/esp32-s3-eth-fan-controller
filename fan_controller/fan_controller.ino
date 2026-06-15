@@ -1,5 +1,5 @@
 /**************************************************************
- * WAVESHARE ESP32-S3-ETH Fan Controller v5.2.0 (Dual-Core + info/ MQTT + UI Hell/Dunkel)
+ * WAVESHARE ESP32-S3-ETH Fan Controller v5.3.0 (Dual-Core + info/ MQTT + UI Hell/Dunkel + HA-Discovery)
  * Version = FW_VERSION (einzige Quelle der Wahrheit, weiter unten) — Banner/UI/API lesen daraus.
  * Board: Waveshare ESP32-S3-ETH (W5500 via SPI2, PoE)
  * Arduino IDE 2.3.7 | ESP32 Arduino Core 3.3.8
@@ -53,7 +53,7 @@ static const uint32_t OTA_HEALTH_MS = 90000;
 // ==== Limits & Timing ====
 // ==== Version (Semver, EINZIGE Quelle der Wahrheit) ====
 // Bumpen + git-Tag vX.Y.Z müssen zusammenpassen. MAJOR=Architektur/Breaking, MINOR=Feature, PATCH=Fix.
-#define FW_VERSION "5.2.0"
+#define FW_VERSION "5.3.0"
 
 static const uint8_t  MAX_FANS              = 8;
 // §4.7: Arduino-loopTask laeuft auf Core 1 = Control-Core. ISR-/PCNT-/LEDC-Registrierung MUSS
@@ -140,6 +140,7 @@ struct MQTTConfig {
   char     user[32] = "";
   char     pass[32] = "";
   char     prefix[16] = "esp";
+  bool     haDisc = false;   // §5.5 Home-Assistant-MQTT-Discovery (default aus)
 } mqttConfig;
 
 // ==== System State ====
@@ -542,6 +543,7 @@ static void loadMQTTConfig() {
     p.getString("user",   mqttConfig.user,   sizeof(mqttConfig.user));
     p.getString("pass",   mqttConfig.pass,   sizeof(mqttConfig.pass));
     p.getString("prefix", mqttConfig.prefix, sizeof(mqttConfig.prefix));
+    mqttConfig.haDisc = p.getBool("hadisc", false);
   }
   p.end();
   LOGI("PREFS", String("MQTT: ") + (mqttConfig.enabled ? "on" : "off") + " host=" + mqttConfig.host + " port=" + mqttConfig.port);
@@ -846,6 +848,29 @@ static void mqttSubscribeFan(uint8_t i) {
   mqtt.subscribe((topicFan(i) + "/set").c_str(), [i](const std::string &p) { mqttApplySet(i, p); });
 }
 
+// §5.5 HA-Discovery: fester Standard-Discovery-Prefix (HA-Default). Config-Topic:
+// homeassistant/<component>/<deviceId>/<object>/config (retained). Liegt rein im MQTT-Layer.
+static const char *HA_PREFIX = "homeassistant";
+static String haCfgTopic(const char *comp, const String &obj) {
+  return String(HA_PREFIX) + "/" + comp + "/" + deviceId + "/" + obj + "/config";
+}
+// Config eines (bereits sanitized) Namens leeren (retained empty) — Cleanup verwaister Entitaeten.
+static void haClearName(const String &san) {
+  if (!mqtt.isConnected()) return;
+  mqtt.publish(haCfgTopic("number", san).c_str(),          "", 1, true);
+  mqtt.publish(haCfgTopic("sensor", san + "_rpm").c_str(), "", 1, true);
+}
+// publish=true: number+sensor Config retained (QoS1) publishen; false: leeren. Name unter fansLock.
+static void haDiscoveryFan(uint8_t i, bool publish) {
+  if (!mqtt.isConnected() || !fanPresentIdx(i)) return;
+  char nm[20]; fansLock(); { uint8_t n = 0; for (; n < 19 && fans[i].name[n]; n++) nm[n] = fans[i].name[n]; nm[n] = 0; } fansUnlock();
+  String san = sanitizeName(String(nm));
+  if (!publish) { haClearName(san); return; }
+  std::string p = mqttConfig.prefix, d = deviceId.c_str(), f = san.c_str(), v = FW_VERSION;
+  mqtt.publish(haCfgTopic("number", san).c_str(),          haNumberConfig(p, d, f, v).c_str(), 1, true);
+  mqtt.publish(haCfgTopic("sensor", san + "_rpm").c_str(), haSensorConfig(p, d, f, v).c_str(), 1, true);
+}
+
 // Von esp-mqtt bei (Re-)Connect aufgerufen (MQTT-Task-Kontext): online melden, abonnieren, Ist publishen.
 void onMqttConnect(esp_mqtt_client_handle_t client) {
   if (!mqtt.isMyTurn(client)) return;
@@ -865,11 +890,13 @@ void onMqttConnect(esp_mqtt_client_handle_t client) {
     String base = topicDev() + "/" + snap.names[k];
     mqtt.publish((base + "/speed").c_str(), "", 0, true);
     mqtt.unsubscribe((base + "/set").c_str());
+    haClearName(String(snap.names[k]));   // §5.5: verwaiste HA-Entitaeten mitraeumen
   }
   for (uint8_t i = 0; i < MAX_FANS; i++) {
     if (!fanPresentIdx(i)) continue;
     mqttSubscribeFan(i);
     mqttPublishSpeed(i);
+    haDiscoveryFan(i, mqttConfig.haDisc);   // §5.5: an -> Config publishen, aus -> leeren (Cleanup nach Toggle)
   }
   LOGI("MQTT", "connected");
 }
@@ -899,8 +926,9 @@ static void applyDo(ApplyJob &j) {
         String baseOld = topicDev() + "/" + sname;
         mqtt.publish((baseOld + "/speed").c_str(), "", 0, true);
         mqtt.unsubscribe((baseOld + "/set").c_str());
+        haClearName(sname);   // §5.5: HA-Entitaeten des geloeschten Luefters entfernen
       } else {
-        pendingCleanupQueue(sname.c_str());   // §18: bei Disconnect vormerken -> onMqttConnect raeumt nach
+        pendingCleanupQueue(sname.c_str());   // §18: bei Disconnect vormerken -> onMqttConnect raeumt nach (inkl. HA)
       }
     }
 
@@ -930,12 +958,13 @@ static void applyDo(ApplyJob &j) {
         String oldBase = topicDev() + "/" + sname;
         mqtt.publish((oldBase + "/speed").c_str(), "", 0, true);
         mqtt.unsubscribe((oldBase + "/set").c_str());
+        haClearName(sname);   // §5.5: alte HA-Entitaeten entfernen (neuer Name kommt unten)
       } else {
         pendingCleanupQueue(sname.c_str());   // §18: bei Disconnect vormerken
       }
     }
     fansLock(); safeStrcpy(f.name, sizeof(f.name), String(j.name)); fansUnlock();   // §19
-    if (mqtt.isConnected()) { mqttSubscribeFan(idx); mqttPublishSpeed(idx); }
+    if (mqtt.isConnected()) { mqttSubscribeFan(idx); mqttPublishSpeed(idx); if (mqttConfig.haDisc) haDiscoveryFan(idx, true); }
     Preferences p; p.begin("fans", false);
     p.putString((String("f") + idx + "_name").c_str(), f.name);
     p.end();
@@ -1181,6 +1210,7 @@ static void sendJsonStatus(NetworkClient &c) {
   c.print(F(",\"port\":")); c.print(mqttConfig.port);
   c.print(F(",\"user\":")); jsonPrintEscaped(c, mqttConfig.user);
   c.print(F(",\"prefix\":")); jsonPrintEscaped(c, mqttConfig.prefix);
+  c.print(F(",\"hadisc\":")); c.print(mqttConfig.haDisc ? "true" : "false");
   c.print(F("}"));
   c.print(F(",\"free_pwm\":["));
   { bool fp = true;
@@ -1417,6 +1447,7 @@ static void apiCalib(NetworkClient &c, const String &body) {
 static void apiMqttSave(NetworkClient &c, const String &body) {
   String s;
   mqttConfig.enabled = body.indexOf(F("enabled=1")) >= 0;
+  mqttConfig.haDisc  = body.indexOf(F("hadisc=1")) >= 0;
   if (formGet(body, F("host"),   s)) safeStrcpy(mqttConfig.host,   sizeof(mqttConfig.host),   s);
   if (formGet(body, F("port"),   s)) mqttConfig.port = (uint16_t)constrain(s.toInt(), 1, 65535);
   if (formGet(body, F("user"),   s)) safeStrcpy(mqttConfig.user,   sizeof(mqttConfig.user),   s);
@@ -1429,6 +1460,7 @@ static void apiMqttSave(NetworkClient &c, const String &body) {
   p.putString("user",   mqttConfig.user);
   p.putString("pass",   mqttConfig.pass);
   p.putString("prefix", mqttConfig.prefix);
+  p.putBool("hadisc", mqttConfig.haDisc);
   p.end();
   LOGI("MQTT", "config saved -> reboot");
   apiOk(c);
