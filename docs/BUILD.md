@@ -4,8 +4,9 @@
 
 - **Arduino IDE 2.x** oder **arduino-cli**
 - **ESP32 Arduino Core 3.3.x** (Boardverwalter-URL von Espressif)
-- Libraries: `Ethernet`, `PubSubClient` (über den Library-Manager) — `Update`, `Preferences`, `SPI`
-  kommen mit dem Core.
+- Libraries: **`ESP32MQTTClient`** (über den Library-Manager) — Ethernet läuft über den
+  nativen `ETH.h`-Treiber (im Core enthalten), MQTT über esp-mqtt (Core) via ESP32MQTTClient.
+  `Update`, `Preferences`, `SPI`, `ESPmDNS` kommen mit dem Core.
 - Zum Erzeugen des UI-Assets: `gzip` + `xxd` (auf macOS/Linux vorhanden), `bash`.
 
 ## Schritt 1 — Web-UI ins Image einbetten

@@ -1,13 +1,15 @@
 /**************************************************************
- * WAVESHARE ESP32-S3-ETH Fan Controller v4.0 (Stufe 1: Haertung + neues UI)
+ * WAVESHARE ESP32-S3-ETH Fan Controller v5.0.0 (Dual-Core: native ETH.h + esp-mqtt + Core-Split)
+ * Version = FW_VERSION (einzige Quelle der Wahrheit, weiter unten) — Banner/UI/API lesen daraus.
  * Board: Waveshare ESP32-S3-ETH (W5500 via SPI2, PoE)
- * Arduino IDE 2.3.7 | ESP32 Arduino Core 3.3.5
+ * Arduino IDE 2.3.7 | ESP32 Arduino Core 3.3.8
  * W5500 Pins: MISO=12, MOSI=11, SCLK=13, CS=14, RST=9
  * Board-Setting: "USB CDC On Boot: Enabled" ist PFLICHT
  **************************************************************/
 
 // --- Arduino autoproto fix ---
 #include <stdint.h>
+#include <atomic>   // §4.5: std::atomic fuer Cross-Core-Skalare (C11 _Atomic compiliert in C++/GCC nicht)
 enum FanFault : uint8_t;
 struct Fan;
 struct ApplyJob;
@@ -15,12 +17,13 @@ struct ApplyJob;
 // ==== Includes ====
 #include <Arduino.h>
 #include <SPI.h>
-#include <Ethernet.h>
 #include <Update.h>
-#include <PubSubClient.h>
+#include "ESP32MQTTClient.h"   // thread-safe esp-mqtt (eigener Task); ersetzt PubSubClient
 #include <Preferences.h>
 
 #include "fw_util.h"
+#include "concurrency.h"   // Stufe 3: Cross-Core-Queues (Telemetrie/Duty/...)
+#include "net_eth.h"   // nativer W5500-Treiber (ETH.h) + Link-Events; ersetzt Ethernet.h
 
 #include "esp_wifi.h"
 #include "esp_bt.h"
@@ -42,18 +45,21 @@ extern "C" {
 // (Definition NACH allen Includes — Arduino-Autoproto, siehe CLAUDE.md §4.)
 extern "C" bool verifyRollbackLater() { return true; }
 
-static bool g_otaPendingVerify = false;
+static std::atomic<bool> g_otaPendingVerify{false};
 static const uint32_t OTA_HEALTH_MS = 90000;
 
-// ==== Board-Pins (Waveshare ESP32-S3-ETH, W5500) ====
-#define ETH_MISO 12
-#define ETH_MOSI 11
-#define ETH_SCLK 13
-#define ETH_CS   14
-#define ETH_RST   9
+// W5500-Board-Pins liegen jetzt in net_eth.h (ETH_PIN_*/ETH_SPI_*).
 
 // ==== Limits & Timing ====
+// ==== Version (Semver, EINZIGE Quelle der Wahrheit) ====
+// Bumpen + git-Tag vX.Y.Z müssen zusammenpassen. MAJOR=Architektur/Breaking, MINOR=Feature, PATCH=Fix.
+#define FW_VERSION "5.0.0"
+
 static const uint8_t  MAX_FANS              = 8;
+// §4.7: Arduino-loopTask laeuft auf Core 1 = Control-Core. ISR-/PCNT-/LEDC-Registrierung MUSS
+// von hier erfolgen (Affinitaet folgt dem Registrar), damit tachEdgeCore + Zaehler auf demselben
+// Core wie ihre Schreiber (fanSetDuty) liegen -> dann genuegt volatile (kein Mutex noetig).
+#define CONTROL_CORE 1
 static const uint32_t PWM_FREQ_HZ           = 25000;
 static const uint8_t  PWM_BITS              = 8;
 static const uint8_t  PULSES_PER_REV        = 2;
@@ -88,11 +94,9 @@ static const uint16_t PCNT_FILTER_CYCLES = 800;
 static const uint8_t  CRASH_LOOP_LIMIT       = 3;
 static const uint32_t STATE_WRITE_DEBOUNCE_MS = 2500;
 
-// Ethernet
-static const unsigned long DHCP_RETRY_MS           = 3000;
+// Ethernet (nativer ETH.h-Treiber; DHCP/Lease-Erneuerung macht esp-netif selbst)
 static const uint32_t      ETH_REINIT_COOLDOWN_MS  = 5000;
 static const uint32_t      ETH_LINK_LOST_RESET_MS  = 15000;
-static const uint32_t      ETH_MAINTAIN_INTERVAL_MS = 10000;
 
 // ==== Pin-Listen (Waveshare ESP32-S3-ETH) ====
 // Geblockt: W5500 (9-14), USB CDC (19-20), Strapping (0,3,43-46)
@@ -143,7 +147,7 @@ static String   gLogBuf, gPrevLogTail;
 static uint32_t g_bootCount = 0;
 static bool     g_crashLoopDetected = false;
 static String   g_resetReasonStr = "OTHER";
-static uint32_t g_minFreeHeap = UINT32_MAX;
+static std::atomic<uint32_t> g_minFreeHeap{UINT32_MAX};
 static String   deviceId;
 static uint8_t  g_mac[6];
 static uint8_t  g_crashStreak = 0;
@@ -165,26 +169,43 @@ static inline const char *resetReasonStr(esp_reset_reason_t r) {
   }
 }
 
-static char g_logLineBuf[256];
+// §4.6: gLogBuf (Heap-String) wird von beiden Cores beruehrt -> Mutex. Producer (LOG-Makros)
+// posten in die Log-Queue (thread-safe, nie blockierend); EIN Consumer (logDrain) haengt an.
+static SemaphoreHandle_t logMutex = nullptr;
+static inline void logLock()   { if (logMutex) xSemaphoreTake(logMutex, portMAX_DELAY); }
+static inline void logUnlock() { if (logMutex) xSemaphoreGive(logMutex); }
 
+// Consumer-Seite: haengt eine Zeile an gLogBuf (mit Ringkuerzung). NUR via logDrain (ein Task).
 static void logLine(const char *s) {
   size_t slen = strlen(s);
+  logLock();
   if (gLogBuf.length() + slen + 1 > LOG_MAX) {
     int cut = (gLogBuf.length() + slen + 1) - LOG_MAX + 256;
     if (cut < (int)gLogBuf.length()) gLogBuf.remove(0, cut);
     else gLogBuf = "";
   }
   gLogBuf += s; gLogBuf += '\n';
-  Serial.println(s);
+  logUnlock();
 }
 
+// Producer-Seite (beide Cores): sofort auf Serial (Debug) + in die Log-Queue (gLogBuf via Consumer).
+// Lokaler Puffer statt geteiltem Static -> thread-safe ohne Lock im Hot-Path.
 static void logFmt(char level, const char *tag, const char *msg) {
+  char line[128];
   uint32_t ms = millis();
-  snprintf(g_logLineBuf, sizeof(g_logLineBuf),
+  snprintf(line, sizeof(line),
            "[T+%04lu.%03lus #%lu] [%c] %s: %s",
            (unsigned long)(ms / 1000UL), (unsigned long)(ms % 1000UL),
            (unsigned long)g_bootCount, level, tag, msg);
-  logLine(g_logLineBuf);
+  Serial.println(line);
+  logPost(line);
+}
+
+// Leert die Log-Queue in gLogBuf. NUR aus EINEM Task (Loop bis Task 8, dann networkTask).
+static void logDrain() {
+  if (!g_logQ) return;
+  LogLine l;
+  while (xQueueReceive(g_logQ, &l, 0) == pdTRUE) logLine(l.text);
 }
 
 #define LOGI(t, m) logFmt('I', t, (String(m)).c_str())
@@ -192,8 +213,10 @@ static void logFmt(char level, const char *tag, const char *msg) {
 #define LOGE(t, m) logFmt('E', t, (String(m)).c_str())
 
 static void persistLogTail() {
-  if (gLogBuf.isEmpty()) return;
+  logLock();                          // §4.6: gLogBuf-Snapshot unter Lock (Consumer haengt evtl. parallel an)
+  if (gLogBuf.isEmpty()) { logUnlock(); return; }
   String tail = gLogBuf;
+  logUnlock();
   if (tail.length() > (int)LOG_NVS_MAX) tail.remove(0, tail.length() - LOG_NVS_MAX);
   Preferences p; p.begin("sys", false);
   p.putString("log_tail", tail);
@@ -336,7 +359,6 @@ static void clearFanNVS(uint8_t idx) {
   p.putUChar((k + "pwm").c_str(),  0xFF);
   p.putUChar((k + "tac").c_str(),  0xFF);
   p.putUChar((k + "inv").c_str(),  0);
-  p.putUChar((k + "duty").c_str(), 0);
   p.putUChar((k + "cmin").c_str(), 0);
   p.putString((k + "cnote").c_str(), "");
   p.putString((k + "name").c_str(), "");
@@ -376,17 +398,42 @@ static void fanAutoValidate(uint8_t idx) {
 }
 
 // ==== Globaler State ====
-static uint32_t g_stateRev = 0;
+static std::atomic<uint32_t> g_stateRev{0};
 
-// ==== Ethernet/MQTT Objects ====
-EthernetServer httpServer(80);
-EthernetClient ethClient;
-PubSubClient   mqtt(ethClient);
+// §4.3 (Spec): EIN Mutex schuetzt fans[]-Felder, die der esp-mqtt-Task liest, waehrend der
+// Loop-Task sie schreibt — plus die Pending-Cleanup-Liste. Disziplin: NIE ueber Socket-I/O
+// (mqtt.publish) halten -> unter Lock snapshotten, Lock freigeben, DANN senden. Fundament fuer
+// den Dual-Core-Split (Stufe 3); behebt heute schon den §19-Datarace Loop<->esp-mqtt-Task.
+static SemaphoreHandle_t fansMutex = nullptr;
+static PendingCleanup    g_pendingCleanup = {};
+static inline void fansLock()   { if (fansMutex) xSemaphoreTake(fansMutex, portMAX_DELAY); }
+static inline void fansUnlock() { if (fansMutex) xSemaphoreGive(fansMutex); }
+// §18: einen sanitized Namen zum Nachraeumen vormerken (Loop-Task; Liste ist Cross-Task -> Lock).
+static void pendingCleanupQueue(const char *sanitizedName) {
+  fansLock();
+  bool ok = pendingCleanupAdd(g_pendingCleanup, sanitizedName);
+  fansUnlock();
+  if (!ok) LOGW("MQTT", "cleanup-Liste voll - Topic verwaist");
+}
+
+// ==== Netz/MQTT-Objekte (nativer ETH.h-Stack) ====
+NetworkServer    httpServer(80);
+ESP32MQTTClient  mqtt;   // esp-mqtt im eigenen FreeRTOS-Task, thread-safe, Auto-Reconnect
+static String    g_mqttClientId;   // persistent (ESP32MQTTClient speichert nur den Pointer)
+static String    g_mqttLwtTopic;
 
 // ==== MQTT Helpers ====
 static String topicDev() { return String(mqttConfig.prefix) + "/" + deviceId; }
 // Flaches Schema (Spec §4): <prefix>/<deviceId>/<name>/{speed,set,rpm}
-static String topicFan(uint8_t i) { return topicDev() + "/" + sanitizeName(fans[i].name); }
+// §19: Namen unter Lock snapshotten — der Loop-Task kann fans[i].name gerade memset/strcpy'en.
+static String topicFan(uint8_t i) {
+  char name[20]; uint8_t n = 0;
+  fansLock();
+  for (; n < sizeof(name) - 1 && fans[i].name[n]; n++) name[n] = fans[i].name[n];
+  name[n] = 0;
+  fansUnlock();
+  return topicDev() + "/" + sanitizeName(String(name));
+}
 
 // pctFromDuty/dutyFromPct kommen aus fw_util.h (host-getestet)
 
@@ -434,17 +481,7 @@ static void disableRadios() {
 }
 
 // ==== W5500 Reset ====
-static void resetW5500() {
-  pinMode(ETH_RST, OUTPUT);
-  digitalWrite(ETH_RST, LOW);
-  delay(50);
-  digitalWrite(ETH_RST, HIGH);
-  delay(200);
-  SPI.end();
-  SPI.begin(ETH_SCLK, ETH_MISO, ETH_MOSI, ETH_CS);
-  SPI.setFrequency(20000000);
-  Ethernet.init(ETH_CS);
-}
+// W5500-Reset/Init liegt jetzt in net_eth.h: ethBegin() / ethHardReset().
 
 // ==== Duty-State Persistenz ====
 static uint8_t  g_lastSavedDuty[MAX_FANS] = {0};
@@ -511,7 +548,7 @@ static void loadMQTTConfig() {
 }
 
 // ==== JSON Helpers ====
-static void jsonPrintEscaped(EthernetClient &c, const char *s) {
+static void jsonPrintEscaped(NetworkClient &c, const char *s) {
   c.print('"');
   for (const char *p = s; *p; ++p) {
     char ch = *p;
@@ -540,7 +577,8 @@ static void fanSetDuty(Fan &f, uint8_t duty) {
 static void onDutyChanged(uint8_t idx) {
   if (idx >= MAX_FANS || !fanPresentIdx(idx)) return;
   stateScheduleDutySave(idx, fans[idx].duty);
-  mqttPublishSpeed(idx);
+  TelemetrySample s = { idx, TELEM_SPEED, fans[idx].duty, 0, (uint8_t)fans[idx].fault };  // §4.1: Control postet
+  telemPost(s);
 }
 
 // ==== ISR (Glitchfilter) ====
@@ -614,6 +652,7 @@ static bool enablePcntForFan(uint8_t idx, pcnt_unit_t unit) {
 }
 
 static void enableIsrForFan(uint8_t idx) {
+  if (xPortGetCoreID() != CONTROL_CORE) LOGE("AFFIN", String("ISR-Setup auf Core ") + xPortGetCoreID() + " (erwartet " + CONTROL_CORE + ")");  // §4.7
   Fan &f = fans[idx];
   if (canAttachInterruptPin(f.tachPin)) {
     attachInterrupt(digitalPinToInterrupt(f.tachPin), tachISRs[idx], FALLING);
@@ -635,6 +674,7 @@ static uint32_t pcntReadDeltaAndClear(uint8_t idx) {
 
 // ==== Deterministische PCNT-Zuweisung ====
 static void rebuildPcntMap() {
+  if (xPortGetCoreID() != CONTROL_CORE) LOGE("AFFIN", String("PCNT-Setup auf Core ") + xPortGetCoreID() + " (erwartet " + CONTROL_CORE + ")");  // §4.7
   for (uint8_t i = 0; i < MAX_FANS; i++) {
     if (!fanPresentIdx(i)) continue;
     fans[i].measureSuspended = true;
@@ -704,158 +744,141 @@ struct ApplyJob {
   bool     pinsChanged = false;
   bool     nameChanged = false;
   bool     invChanged  = false;
+  bool     calChanged  = false;        // §4.4: Calib ueber die Queue statt fans[]-Bypass in apiCalib
+  uint8_t  calMin      = 0;
+  char     calNote[40] = {0};
 };
 
-static ApplyJob g_apply[MAX_FANS];
-static bool     g_anyApplyPending = false;
-
+// §4.2: Apply-Job-Queue (by value) Core0->Core1, ersetzt g_apply[]/g_anyApplyPending.
 static void applyQueue(uint8_t idx, const ApplyJob &src) {
-  if (idx >= MAX_FANS) return;
-  g_apply[idx] = src;
-  g_apply[idx].active = true;
-  g_anyApplyPending = true;
+  if (idx >= MAX_FANS || !g_applyQ) return;
+  ApplyJob j = src; j.idx = idx; j.active = true;
+  xQueueSend(g_applyQ, &j, 0);   // Drop bei Voll (UI macht eine Aktion/Mal; Loop drained jeden Durchlauf)
   LOGI("APPLY", String("queued idx=") + idx + " del=" + (src.deleteFan ? "1" : "0") +
        " pins=" + (src.pinsChanged ? "1" : "0") + " name=" + (src.nameChanged ? "1" : "0"));
 }
 
-// ==== Duty-Queue (HTTP/MQTT entkoppelt) ====
-static volatile int16_t g_pendingDuty[MAX_FANS];
-static volatile bool    g_pendingDutyAny = false;
-
-static void dutyPendingInit() {
-  for (uint8_t i = 0; i < MAX_FANS; i++) g_pendingDuty[i] = -1;
-  g_pendingDutyAny = false;
-}
+// ==== Duty-Queue (§4.2: FreeRTOS-Queue Core0->Core1, ersetzt g_pendingDuty[]) ====
+// Producer (Netz: HTTP/MQTT) postet nur; der Consumer (Control-Core) validiert gegen fans[].
 static inline void dutyEnqueue(uint8_t idx, uint8_t duty) {
-  if (idx >= MAX_FANS || !fanPresentIdx(idx)) return;
-  g_pendingDuty[idx] = (int16_t)duty;
-  g_pendingDutyAny = true;
+  if (idx >= MAX_FANS) return;
+  DutyCmd d = { idx, duty };
+  dutyPost(d);
 }
 static void dutyProcessQueue() {
-  if (!g_pendingDutyAny) return;
-  bool any = false;
-  for (uint8_t i = 0; i < MAX_FANS; i++) {
-    int16_t d = g_pendingDuty[i];
-    if (d >= 0) {
-      g_pendingDuty[i] = -1;
-      fanSetDuty(fans[i], (uint8_t)d);
-      onDutyChanged(i);
+  if (!g_dutyQ) return;
+  DutyCmd d;
+  while (xQueueReceive(g_dutyQ, &d, 0) == pdTRUE) {
+    if (d.idx < MAX_FANS && fanPresentIdx(d.idx)) {
+      fanSetDuty(fans[d.idx], d.duty);
+      onDutyChanged(d.idx);
     }
-    if (g_pendingDuty[i] >= 0) any = true;
   }
-  g_pendingDutyAny = any;
 }
 
 // ==== MQTT Publish/Subscribe ====
 static uint16_t g_lastRpmSent[MAX_FANS] = {0};
 
 static void mqttPublishSpeed(uint8_t i) {
-  if (!mqtt.connected() || !fanPresentIdx(i)) return;
+  if (!mqtt.isConnected() || !fanPresentIdx(i)) return;
   char b[4]; snprintf(b, sizeof(b), "%u", (unsigned)pctFromDuty(fans[i].duty));
-  String t = topicFan(i) + "/speed";
-  mqtt.publish(t.c_str(), b, true);
+  mqtt.publish((topicFan(i) + "/speed").c_str(), b, 0, true);
 }
 
-static void mqttPublishRPM(uint8_t i, bool force) {
-  if (!mqtt.connected() || !fanPresentIdx(i)) return;
+// §4.1: RPM-Telemetrie posten statt direkt publishen. Throttle bleibt PRODUCER-seitig
+// (Keepalive/Delta) -> haelt die Queue leicht; der Netz-Task (telemDrain) published nur noch.
+// Throttle-State (lastRpmPubMs/g_lastRpmSent) gehoert dem Control-Core -> kein Cross-Core-Zugriff.
+static void telemPostRpm(uint8_t i) {
+  if (!fanPresentIdx(i)) return;
   uint32_t now = millis();
   uint16_t rpm = fans[i].rpmShown;
-  bool due = force;
-  if (!due) {
-    if (fans[i].lastRpmPubMs == 0) due = true;
-    else if (now - fans[i].lastRpmPubMs >= MQTT_PUB_MS_KEEPALIVE) due = true;
-    else if (abs((int)rpm - (int)g_lastRpmSent[i]) >= MQTT_RPM_ABS_DELTA) due = true;
-  }
+  bool due = (fans[i].lastRpmPubMs == 0)
+          || elapsed(now, fans[i].lastRpmPubMs, MQTT_PUB_MS_KEEPALIVE)
+          || abs((int)rpm - (int)g_lastRpmSent[i]) >= MQTT_RPM_ABS_DELTA;
   if (!due) return;
-
-  char b[12]; snprintf(b, sizeof(b), "%u", (unsigned)rpm);
-  String t = topicFan(i) + "/rpm";
-  mqtt.publish(t.c_str(), b, false);
+  TelemetrySample s = { i, TELEM_RPM, fans[i].duty, rpm, (uint8_t)fans[i].fault };
+  telemPost(s);
   fans[i].lastRpmPubMs = now;
   g_lastRpmSent[i] = rpm;
 }
 
-static void mqttCallback(char *topic, byte *payload, unsigned int length) {
-  String t(topic);
-  String pre = topicDev() + "/";
-  if (!t.startsWith(pre) || !t.endsWith(F("/set"))) return;
-  String fanKey = t.substring(pre.length(), t.length() - 4);  // ".../<name>/set"
-
-  char buf[8];
-  unsigned int n = min(length, (unsigned)sizeof(buf) - 1), j = 0;
-  bool hasDigit = false;
-  for (unsigned int i = 0; i < n; i++) {
-    if (payload[i] >= 32) buf[j++] = (char)payload[i];
-    if (payload[i] >= '0' && payload[i] <= '9') hasDigit = true;
-  }
-  buf[j] = 0;
-  // [Review-Fund E] Leere/ziffernlose Payload ignorieren statt versehentlich auf 0% zu fahren
-  // (schuetzt gegen Fehl-Publishes und geleerte retained Topics).
-  if (!hasDigit) { LOGW("MQTT", "set ohne Zahl ignoriert"); return; }
-  int pct = constrain(atoi(buf), 0, 100);
-
-  for (uint8_t i = 0; i < MAX_FANS; i++) {
-    if (!fanPresentIdx(i)) continue;
-    if (sanitizeName(fans[i].name) == fanKey) {
-      dutyEnqueue(i, dutyFromPct((uint8_t)pct));
-      LOGI("MQTT", String("set ") + fans[i].name + " -> " + pct + "%");
-      return;
+// Telemetrie-Queue leeren und via esp-mqtt publishen. NUR aus dem Netz-Kontext aufrufen
+// (Task 8: networkTask). Liest fans[] nicht ausser topicFan (Name unter fansMutex).
+static void telemDrain() {
+  if (!g_telemQ) return;
+  TelemetrySample s;
+  while (xQueueReceive(g_telemQ, &s, 0) == pdTRUE) {
+    if (!mqtt.isConnected()) continue;          // Queue trotzdem leeren (kein Stau)
+    String base = topicFan(s.idx);
+    if (s.kind == TELEM_SPEED) {
+      char b[4]; snprintf(b, sizeof(b), "%u", (unsigned)pctFromDuty(s.duty));
+      mqtt.publish((base + "/speed").c_str(), b, 0, true);
+    } else {
+      char b[12]; snprintf(b, sizeof(b), "%u", (unsigned)s.rpm);
+      mqtt.publish((base + "/rpm").c_str(), b, 0, false);
     }
   }
-  LOGW("MQTT", "set for unknown fan");
 }
 
-static bool ethHasIP = false, httpUp = false;
-static bool mqttWasConnected = false;
-static uint32_t g_lastMqttTryMs = 0;
-static uint32_t g_mqttBackoffMs = 3000;
-
-static void mqttEnsureConnected() {
-  if (!mqttConfig.enabled || strlen(mqttConfig.host) == 0 || !ethHasIP) { mqttWasConnected = false; return; }
-  uint32_t now = millis();
-
-  if (mqtt.connected()) {
-    if (!mqttWasConnected) {
-      String willTopic = topicDev() + "/status";
-      mqtt.publish(willTopic.c_str(), "online", true);
-      for (uint8_t i = 0; i < MAX_FANS; i++) {
-        if (!fanPresentIdx(i)) continue;
-        mqtt.subscribe((topicFan(i) + "/set").c_str());
-        mqttPublishSpeed(i);
-      }
-      mqttWasConnected = true;
-      g_mqttBackoffMs = 3000;
-      g_lastMqttTryMs = now;
-      LOGI("MQTT", "connected");
-    }
-    return;
+// Befehl von <prefix>/<deviceId>/<fan>/set anwenden. idx ist im Subscribe-Lambda gebunden,
+// daher kein Topic-Parsen nötig. [Review-Fund E] Payload ohne Ziffer ignorieren (kein 0%-Unfall).
+static void mqttApplySet(uint8_t idx, const std::string &payload) {
+  bool hasDigit = false;
+  for (char c : payload) if (c >= '0' && c <= '9') { hasDigit = true; break; }
+  if (!hasDigit) { LOGW("MQTT", "set ohne Zahl ignoriert"); return; }
+  int pct = constrain(atoi(payload.c_str()), 0, 100);
+  if (idx < MAX_FANS && fanPresentIdx(idx)) {
+    dutyEnqueue(idx, dutyFromPct((uint8_t)pct));   // Cross-Task -> Duty-Queue
+    char nm[20]; fansLock(); { uint8_t n=0; for(; n<19 && fans[idx].name[n]; n++) nm[n]=fans[idx].name[n]; nm[n]=0; } fansUnlock();  // §19: Name fuer Log unter Lock
+    LOGI("MQTT", String("set ") + nm + " -> " + pct + "%");
   }
+}
 
-  if (!elapsed(now, g_lastMqttTryMs, g_mqttBackoffMs)) return;
-  g_lastMqttTryMs = now;
+static bool                  ethHasIP = false;   // nur im networkTask (Core 0) benutzt
+static std::atomic<bool>     httpUp{false};       // networkTask setzt; Health-Window (loopTask) liest -> Commit-Gate
+static std::atomic<uint32_t> g_netCtr{0};         // networkTask-Heartbeat (Liveness: Commit-Gate + /api/status)
+static std::atomic<uint32_t> g_loopCtr{0};        // Control-Loop-Heartbeat (Liveness)
+static TaskHandle_t          g_netTaskHandle = nullptr;
+static inline void feedWdt() { esp_task_wdt_reset(); }   // §5.3: fuettert den AKTUELLEN Task (beide abonniert)
 
-  mqtt.setServer(mqttConfig.host, mqttConfig.port);
-  mqtt.setCallback(mqttCallback);
+// Jeden vorhandenen Lüfter auf .../set abonnieren (idx-gebundenes Lambda).
+static void mqttSubscribeFan(uint8_t i) {
+  mqtt.subscribe((topicFan(i) + "/set").c_str(), [i](const std::string &p) { mqttApplySet(i, p); });
+}
 
-  String willTopic = topicDev() + "/status";
-  bool ok = (strlen(mqttConfig.user) > 0)
-              ? mqtt.connect((deviceId + "-cli").c_str(), mqttConfig.user, mqttConfig.pass, willTopic.c_str(), 1, true, "offline")
-              : mqtt.connect((deviceId + "-cli").c_str(), NULL, NULL, willTopic.c_str(), 1, true, "offline");
-
-  if (ok) {
-    mqttWasConnected = false;
-  } else {
-    LOGW("MQTT", String("connect failed, state=") + mqtt.state());
-    g_mqttBackoffMs = min<uint32_t>(g_mqttBackoffMs * 2, 60000);
+// Von esp-mqtt bei (Re-)Connect aufgerufen (MQTT-Task-Kontext): online melden, abonnieren, Ist publishen.
+void onMqttConnect(esp_mqtt_client_handle_t client) {
+  if (!mqtt.isMyTurn(client)) return;
+  mqtt.publish((topicDev() + "/status").c_str(), "online", 0, true);
+  // §18: ZUERST verwaiste retained Topics aus der Disconnect-Phase raeumen (snapshot-then-send) —
+  // vor dem present-Loop, damit ein im selben Slot neu angelegter, gleichnamiger Luefter zuletzt
+  // gewinnt (Subscribe/Publish nicht versehentlich vom Cleanup ueberschrieben).
+  PendingCleanup snap;
+  fansLock(); snap = g_pendingCleanup; pendingCleanupClear(g_pendingCleanup); fansUnlock();
+  for (uint8_t k = 0; k < snap.count; k++) {
+    String base = topicDev() + "/" + snap.names[k];
+    mqtt.publish((base + "/speed").c_str(), "", 0, true);
+    mqtt.unsubscribe((base + "/set").c_str());
   }
+  for (uint8_t i = 0; i < MAX_FANS; i++) {
+    if (!fanPresentIdx(i)) continue;
+    mqttSubscribeFan(i);
+    mqttPublishSpeed(i);
+  }
+  LOGI("MQTT", "connected");
+}
+
+// Event-Trampolin für esp-mqtt (IDF 5.x), von loopStart() registriert.
+void handleMQTT(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data) {
+  (void)handler_args; (void)base; (void)event_id;
+  mqtt.onEventCallback(static_cast<esp_mqtt_event_handle_t>(event_data));
 }
 
 // ==== Apply-Worker ====
 // [B3] g_stateRev++ nur hier bei Strukturaenderungen
-static void applyDo(uint8_t idx) {
+static void applyDo(ApplyJob &j) {
+  uint8_t idx = j.idx;
   if (idx >= MAX_FANS) return;
-  ApplyJob &j = g_apply[idx];
-  if (!j.active) return;
 
   Fan &f = fans[idx];
 
@@ -864,40 +887,53 @@ static void applyDo(uint8_t idx) {
     if (!isPinBlocked(f.pwmPin)) { ledcWrite(f.pwmPin, 0); ledcDetach(f.pwmPin); }
     detachFanCounters(idx);
 
-    if (mqtt.connected() && f.name[0]) {
-      String baseOld = String(mqttConfig.prefix) + "/" + deviceId + "/" + sanitizeName(String(f.name));
-      mqtt.publish((baseOld + "/speed").c_str(), "", true);
-      mqtt.unsubscribe((baseOld + "/set").c_str());
+    if (f.name[0]) {
+      String sname = sanitizeName(String(f.name));
+      if (mqtt.isConnected()) {
+        String baseOld = topicDev() + "/" + sname;
+        mqtt.publish((baseOld + "/speed").c_str(), "", 0, true);
+        mqtt.unsubscribe((baseOld + "/set").c_str());
+      } else {
+        pendingCleanupQueue(sname.c_str());   // §18: bei Disconnect vormerken -> onMqttConnect raeumt nach
+      }
     }
 
     clearFanNVS(idx);
+    // Persistierten Duty im RICHTIGEN Namespace ("state") raeumen + RAM-Tracking nullen,
+    // sonst erbt ein neuer Luefter im selben Slot nach Reboot die alte Drehzahl.
+    { Preferences p; p.begin("state", false); p.remove((String("f") + idx + "_duty").c_str()); p.end(); }
+    g_lastSavedDuty[idx] = 0;   // stale DutyCmd in g_dutyQ wird beim Drain via fanPresentIdx verworfen
+    g_stateDirty[idx]    = false;
+    fansLock();                         // §19: gegen Cross-Task-Leser (topicFan im esp-mqtt-Task)
     memset(&f, 0, sizeof(Fan));
     f.pwmPin = 0xFF; f.tachPin = 0xFF;
+    fansUnlock();
     g_lastRpmSent[idx] = 0;
 
     rebuildPcntMap();
-    g_stateRev++;
-    j.active = false;
+    g_stateRev.fetch_add(1);
     LOGI("APPLY", String("deleted idx=") + idx);
     return;
   }
 
   // Name change
   if (j.nameChanged) {
-    if (mqtt.connected()) {
-      String oldBase = String(mqttConfig.prefix) + "/" + deviceId + "/" + sanitizeName(String(f.name));
-      mqtt.publish((oldBase + "/speed").c_str(), "", true);
-      mqtt.unsubscribe((oldBase + "/set").c_str());
-      safeStrcpy(f.name, sizeof(f.name), String(j.name));
-      mqtt.subscribe((topicFan(idx) + "/set").c_str());
-      mqttPublishSpeed(idx);
-    } else {
-      safeStrcpy(f.name, sizeof(f.name), String(j.name));
+    if (f.name[0]) {  // alten Topic nur raeumen, wenn es einen gab (nicht bei Neuanlage)
+      String sname = sanitizeName(String(f.name));
+      if (mqtt.isConnected()) {
+        String oldBase = topicDev() + "/" + sname;
+        mqtt.publish((oldBase + "/speed").c_str(), "", 0, true);
+        mqtt.unsubscribe((oldBase + "/set").c_str());
+      } else {
+        pendingCleanupQueue(sname.c_str());   // §18: bei Disconnect vormerken
+      }
     }
+    fansLock(); safeStrcpy(f.name, sizeof(f.name), String(j.name)); fansUnlock();   // §19
+    if (mqtt.isConnected()) { mqttSubscribeFan(idx); mqttPublishSpeed(idx); }
     Preferences p; p.begin("fans", false);
     p.putString((String("f") + idx + "_name").c_str(), f.name);
     p.end();
-    g_stateRev++;
+    g_stateRev.fetch_add(1);
   }
 
   // Invert change
@@ -910,7 +946,7 @@ static void applyDo(uint8_t idx) {
     Preferences p; p.begin("fans", false);
     p.putUChar((String("f") + idx + "_inv").c_str(), f.invertPwm ? 1 : 0);
     p.end();
-    g_stateRev++;
+    g_stateRev.fetch_add(1);
   }
 
   // Pins changed
@@ -937,15 +973,28 @@ static void applyDo(uint8_t idx) {
     p.putUChar((k + "pwm").c_str(), f.pwmPin);
     p.putUChar((k + "tac").c_str(), f.tachPin);
     p.end();
-    g_stateRev++;
+    g_stateRev.fetch_add(1);
   }
 
-  j.active = false;
+  // Calib change (§4.4: ueber die Queue statt direktem fans[]-Write in apiCalib)
+  if (j.calChanged) {
+    fansLock();
+    fans[idx].calMinStart = j.calMin;
+    safeStrcpy(fans[idx].calNote, sizeof(fans[idx].calNote), String(j.calNote));
+    fansUnlock();
+    Preferences p; p.begin("fans", false);
+    String k = "f" + String(idx) + "_";
+    p.putUChar((k + "cmin").c_str(), j.calMin);
+    p.putString((k + "cnote").c_str(), j.calNote);
+    p.end();
+    g_stateRev.fetch_add(1);
+  }
+
   LOGI("APPLY", String("done idx=") + idx);
 }
 
 // ==== HTTP Basics ====
-static void httpSendHeaderOK(EthernetClient &c, const char *ctype) {
+static void httpSendHeaderOK(NetworkClient &c, const char *ctype) {
   c.println(F("HTTP/1.1 200 OK"));
   c.print(F("Content-Type: ")); c.println(ctype);
   c.println(F("Cache-Control: no-cache, no-store, must-revalidate"));
@@ -953,26 +1002,26 @@ static void httpSendHeaderOK(EthernetClient &c, const char *ctype) {
   c.println(F("Connection: close"));
   c.println();
 }
-static void httpSend400(EthernetClient &c, const char *msg) {
+static void httpSend400(NetworkClient &c, const char *msg) {
   c.println(F("HTTP/1.1 400 Bad Request"));
   c.println(F("Content-Type: text/plain; charset=UTF-8"));
   c.println(F("Connection: close"));
   c.println(); c.println(msg);
 }
-static void httpSend500(EthernetClient &c, const char *msg) {
+static void httpSend500(NetworkClient &c, const char *msg) {
   c.println(F("HTTP/1.1 500 Internal Server Error"));
   c.println(F("Content-Type: text/plain; charset=UTF-8"));
   c.println(F("Connection: close"));
   c.println(); c.println(msg);
 }
-static void httpSend404(EthernetClient &c) {
+static void httpSend404(NetworkClient &c) {
   c.println(F("HTTP/1.1 404 Not Found"));
   c.println(F("Content-Type: text/plain; charset=UTF-8"));
   c.println(F("Connection: close"));
   c.println(); c.println(F("Not found"));
 }
 // ==== UI-Asset (gzip im Flash, chunked) ====
-static void sendUiAsset(EthernetClient &c) {
+static void sendUiAsset(NetworkClient &c) {
   c.println(F("HTTP/1.1 200 OK"));
   c.println(F("Content-Type: text/html; charset=UTF-8"));
   c.println(F("Content-Encoding: gzip"));
@@ -985,16 +1034,16 @@ static void sendUiAsset(EthernetClient &c) {
     size_t n = (UI_ASSET_LEN - off) < 1024 ? (UI_ASSET_LEN - off) : 1024;
     if (c.write(UI_ASSET + off, n) == 0) return;
     off += n;
-    feedLoopWDT();
+    feedWdt();
   }
 }
 
 // ==== JSON-API-Antwort-Helfer ====
-static void apiOk(EthernetClient &c) {
+static void apiOk(NetworkClient &c) {
   httpSendHeaderOK(c, "application/json; charset=UTF-8");
   c.print(F("{\"ok\":true}"));
 }
-static void apiErr(EthernetClient &c, const char *msg) {  // nur statische msg!
+static void apiErr(NetworkClient &c, const char *msg) {  // nur statische msg!
   c.println(F("HTTP/1.1 400 Bad Request"));
   c.println(F("Content-Type: application/json; charset=UTF-8"));
   c.println(F("Connection: close"));
@@ -1005,7 +1054,7 @@ static void apiErr(EthernetClient &c, const char *msg) {  // nur statische msg!
 // Gesamtbudget des aktuellen Nicht-OTA-Requests (Spec §3.1). In handleClient gesetzt.
 static uint32_t g_reqStart = 0;
 
-static bool readLine(EthernetClient &c, String &out, unsigned long timeoutMs) {
+static bool readLine(NetworkClient &c, String &out, unsigned long timeoutMs) {
   out = "";
   unsigned long t0 = millis();
   while (!elapsed(millis(), t0, timeoutMs) && !elapsed(millis(), g_reqStart, HTTP_REQ_BUDGET_MS)) {
@@ -1016,13 +1065,13 @@ static bool readLine(EthernetClient &c, String &out, unsigned long timeoutMs) {
       out += ch;
       if (out.length() > 4096) return true;
     }
-    feedLoopWDT();
+    feedWdt();
     delay(1);
   }
   return (out.length() > 0);
 }
 
-static bool readHeaders(EthernetClient &c, size_t &contentLength, String &contentType) {
+static bool readHeaders(NetworkClient &c, size_t &contentLength, String &contentType) {
   contentLength = 0;
   contentType   = "";
   bool teChunked = false;
@@ -1047,7 +1096,7 @@ static bool readHeaders(EthernetClient &c, size_t &contentLength, String &conten
 }
 
 // [B2] Buffer-Overflow fix: read max sizeof(b)-1 damit b[rd]=0 sicher ist
-static bool handleBodyToString(EthernetClient &c, size_t contentLength, String &out) {
+static bool handleBodyToString(NetworkClient &c, size_t contentLength, String &out) {
   out.reserve(contentLength + 8);
   size_t got = 0;
   unsigned long t0 = millis();
@@ -1063,15 +1112,15 @@ static bool handleBodyToString(EthernetClient &c, size_t contentLength, String &
         out.concat((const char*)b);
         got += rd; t0 = millis();
       }
-    } else { feedLoopWDT(); delay(1); }
+    } else { feedWdt(); delay(1); }
   }
   return (got == contentLength);
 }
 
 // ==== DRY: POST-Body Dispatcher ====
 // Inline function-pointer statt typedef (Arduino autoproto Kompatibilitaet)
-static bool handleFormPost(EthernetClient &c, size_t contentLength, const String &contentType,
-                           void (*handler)(EthernetClient &, const String &)) {
+static bool handleFormPost(NetworkClient &c, size_t contentLength, const String &contentType,
+                           void (*handler)(NetworkClient &, const String &)) {
   if (contentLength == 0 || contentLength > 4096) { httpSend400(c, "bad length"); return false; }
   if (!contentType.startsWith(F("application/x-www-form-urlencoded"))) {
     httpSend400(c, "Unsupported Content-Type");
@@ -1087,35 +1136,39 @@ static bool handleFormPost(EthernetClient &c, size_t contentLength, const String
 }
 
 
-// EthernetClient::write() kappt still bei Socket-Puffergroesse (4KB) und meldet
+// NetworkClient::write() kappt still bei Socket-Puffergroesse (4KB) und meldet
 // trotzdem Erfolg -> NIE mehr als 1KB pro write() schicken (CLAUDE.md §6.11).
-static void printChunked(EthernetClient &c, const char *s, size_t len) {
+static void printChunked(NetworkClient &c, const char *s, size_t len) {
   while (len > 0) {
     size_t n = len < 1024 ? len : 1024;
     if (c.write((const uint8_t *)s, n) == 0) return;
     s += n; len -= n;
-    feedLoopWDT();
+    feedWdt();
   }
 }
 
-static void handleLogTxt(EthernetClient &c)     { httpSendHeaderOK(c, "text/plain; charset=UTF-8"); printChunked(c, gLogBuf.c_str(), gLogBuf.length()); }
-static void handlePrevLogTxt(EthernetClient &c)  { httpSendHeaderOK(c, "text/plain; charset=UTF-8"); printChunked(c, gPrevLogTail.c_str(), gPrevLogTail.length()); }
+static void handleLogTxt(NetworkClient &c)     { httpSendHeaderOK(c, "text/plain; charset=UTF-8"); logLock(); String snap = gLogBuf; logUnlock(); printChunked(c, snap.c_str(), snap.length()); }
+static void handlePrevLogTxt(NetworkClient &c)  { httpSendHeaderOK(c, "text/plain; charset=UTF-8"); printChunked(c, gPrevLogTail.c_str(), gPrevLogTail.length()); }
 
 // ==== JSON Status ====
-static void sendJsonStatus(EthernetClient &c) {
+static void sendJsonStatus(NetworkClient &c) {
   httpSendHeaderOK(c, "application/json");
-  c.print(F("{\"rev\":")); c.print(g_stateRev);
+  c.print(F("{\"rev\":")); c.print(g_stateRev.load());
+  c.print(F(",\"fw_version\":")); jsonPrintEscaped(c, FW_VERSION);
   c.print(F(",\"device\":")); jsonPrintEscaped(c, deviceId.c_str());
-  c.print(F(",\"ip\":")); jsonPrintEscaped(c, Ethernet.localIP().toString().c_str());
-  c.print(F(",\"mqtt_connected\":")); c.print(mqtt.connected() ? "true" : "false");
+  c.print(F(",\"ip\":")); jsonPrintEscaped(c, ethLocalIp().c_str());
+  c.print(F(",\"mqtt_connected\":")); c.print(mqtt.isConnected() ? "true" : "false");
   c.print(F(",\"boot_count\":")); c.print(g_bootCount);
   c.print(F(",\"safe_mode\":")); c.print(g_crashLoopDetected ? "true" : "false");
   c.print(F(",\"reset_reason\":")); jsonPrintEscaped(c, g_resetReasonStr.c_str());
-  c.print(F(",\"min_free_heap\":")); c.print(g_minFreeHeap);
+  c.print(F(",\"min_free_heap\":")); c.print(g_minFreeHeap.load());
   c.print(F(",\"largest_block\":")); c.print(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
   c.print(F(",\"uptime_s\":")); c.print((uint32_t)(esp_timer_get_time() / 1000000ULL));
   c.print(F(",\"wdt\":true"));
-  c.print(F(",\"ota_pending\":")); c.print(g_otaPendingVerify ? "true" : "false");
+  c.print(F(",\"core1_loops\":")); c.print(g_loopCtr.load());        // §8: Control-Liveness
+  c.print(F(",\"net_loops\":")); c.print(g_netCtr.load());          // §8: networkTask-Liveness
+  c.print(F(",\"net_stack_hwm\":")); c.print(g_netTaskHandle ? uxTaskGetStackHighWaterMark(g_netTaskHandle) : 0);  // §9
+  c.print(F(",\"ota_pending\":")); c.print(g_otaPendingVerify.load() ? "true" : "false");
   c.print(F(",\"crash_streak\":")); c.print((int)g_crashStreak);
   c.print(F(",\"mqtt\":{\"enabled\":")); c.print(mqttConfig.enabled ? "true" : "false");
   c.print(F(",\"host\":")); jsonPrintEscaped(c, mqttConfig.host);
@@ -1138,24 +1191,39 @@ static void sendJsonStatus(EthernetClient &c) {
       if (!ft) c.print(','); ft = false; c.print(p);
     } }
   c.print(F("]"));
+  // §4.3: alle pro-Luefter-Felder unter EINEM Lock snapshotten, dann serialisieren (nie Lock ueber Socket).
+  struct FanView { char name[20], cnote[40]; bool occupied, present, validated, inv;
+                   uint8_t duty, pwmPin, tachPin, calMinStart, fault; uint16_t rpm; };
+  FanView v[MAX_FANS];
+  fansLock();
+  for (uint8_t i = 0; i < MAX_FANS; i++) {
+    Fan &f = fans[i];
+    v[i].occupied = (f.name[0] != 0);
+    v[i].present  = fanPresentIdx(i);
+    { uint8_t n = 0; for (; n < 19 && f.name[n];    n++) v[i].name[n]  = f.name[n];    v[i].name[n]  = 0; }
+    { uint8_t n = 0; for (; n < 39 && f.calNote[n]; n++) v[i].cnote[n] = f.calNote[n]; v[i].cnote[n] = 0; }
+    v[i].duty = f.duty; v[i].pwmPin = f.pwmPin; v[i].tachPin = f.tachPin; v[i].calMinStart = f.calMinStart;
+    v[i].rpm = f.rpmShown; v[i].fault = (uint8_t)f.fault; v[i].validated = f.validated; v[i].inv = f.invertPwm;
+  }
+  fansUnlock();
   c.print(F(",\"fans\":["));
   bool first = true;
   for (uint8_t i = 0; i < MAX_FANS; i++) {
-    if (fans[i].name[0] == 0) continue;  // alle belegten Slots (auch unkonfigurierte)
+    if (!v[i].occupied) continue;  // alle belegten Slots (auch unkonfigurierte)
     if (!first) c.print(','); first = false;
     c.print(F("{\"index\":")); c.print(i);
-    c.print(F(",\"name\":")); jsonPrintEscaped(c, fans[i].name);
-    c.print(F(",\"present\":")); c.print(fanPresentIdx(i) ? "true" : "false");
-    c.print(F(",\"pwm\":")); c.print(fans[i].duty);
-    c.print(F(",\"pct\":")); c.print((int)pctFromDuty(fans[i].duty));
-    c.print(F(",\"rpm\":")); c.print(fans[i].rpmShown);
-    c.print(F(",\"pwmPin\":")); c.print(fans[i].pwmPin);
-    c.print(F(",\"tachPin\":")); c.print(fans[i].tachPin);
-    c.print(F(",\"fault\":")); c.print((int)fans[i].fault);
-    c.print(F(",\"validated\":")); c.print(fans[i].validated ? "true" : "false");
-    c.print(F(",\"inv\":")); c.print(fans[i].invertPwm ? "true" : "false");
-    c.print(F(",\"cmin\":")); c.print((int)pctFromDuty(fans[i].calMinStart));
-    c.print(F(",\"cnote\":")); jsonPrintEscaped(c, fans[i].calNote);
+    c.print(F(",\"name\":")); jsonPrintEscaped(c, v[i].name);
+    c.print(F(",\"present\":")); c.print(v[i].present ? "true" : "false");
+    c.print(F(",\"pwm\":")); c.print(v[i].duty);
+    c.print(F(",\"pct\":")); c.print((int)pctFromDuty(v[i].duty));
+    c.print(F(",\"rpm\":")); c.print(v[i].rpm);
+    c.print(F(",\"pwmPin\":")); c.print(v[i].pwmPin);
+    c.print(F(",\"tachPin\":")); c.print(v[i].tachPin);
+    c.print(F(",\"fault\":")); c.print((int)v[i].fault);
+    c.print(F(",\"validated\":")); c.print(v[i].validated ? "true" : "false");
+    c.print(F(",\"inv\":")); c.print(v[i].inv ? "true" : "false");
+    c.print(F(",\"cmin\":")); c.print((int)pctFromDuty(v[i].calMinStart));
+    c.print(F(",\"cnote\":")); jsonPrintEscaped(c, v[i].cnote);
     c.print(F("}"));
   }
   c.print(F("]}"));
@@ -1167,9 +1235,8 @@ static void sendJsonStatus(EthernetClient &c) {
 // NICHT: ein Image, das nicht bootet/haengt, erreicht diesen Pfad nie (bleibt PENDING
 // -> Rollback). Voraussetzung bleibt, dass der Safe-Mode HTTP+OTA am Leben haelt.
 static void commitIfPending() {
-  if (g_otaPendingVerify) {
+  if (g_otaPendingVerify.exchange(false)) {   // idempotent: Doppelaufruf ungefaehrlich
     esp_ota_mark_app_valid_cancel_rollback();
-    g_otaPendingVerify = false;
     LOGI("OTA", "Image als VALID markiert (bewusster Reboot/OTA aus laufendem Image)");
   }
 }
@@ -1178,16 +1245,15 @@ static void commitIfPending() {
 // Log-Tail landet im NVS (zusaetzlich zum Shutdown-Handler).
 static void prepareRestart() {
   commitIfPending();
-  if (mqtt.connected()) {
-    String t = topicDev() + "/status";
-    mqtt.publish(t.c_str(), "offline", true);
-    mqtt.disconnect();
+  if (mqtt.isConnected()) {
+    mqtt.publish((topicDev() + "/status").c_str(), "offline", 0, true);
+    delay(50);   // dem MQTT-Task Zeit zum Senden geben (kein disconnect() in der Lib)
   }
   persistLogTail();
 }
 
 // ==== OTA ====
-static bool handleOTA(EthernetClient &c, size_t contentLength) {
+static bool handleOTA(NetworkClient &c, size_t contentLength) {
   // [Review-Fund 2] Laufendes Image zuerst gueltig markieren: es bedient gerade einen
   // OTA-Upload, ist also gesund. Sonst ruft Update.end()->set_boot_partition() aus einem
   // noch PENDING_VERIFY-Zustand (unklare Rollback-Ecke beim OTA INNERHALB des Health-Windows).
@@ -1219,7 +1285,7 @@ static bool handleOTA(EthernetClient &c, size_t contentLength) {
   while (received < contentLength && !elapsed(millis(), t0, BODY_RD_TIMEOUT)) {
     int n = c.read(buf, min((int)BUFSZ, (int)(contentLength - received)));
     if (n > 0) {
-      feedLoopWDT();
+      feedWdt();
       size_t w = Update.write(buf, n);
       if (w != (size_t)n) {
         httpSendHeaderOK(c, "application/json; charset=UTF-8");
@@ -1231,7 +1297,7 @@ static bool handleOTA(EthernetClient &c, size_t contentLength) {
       received += n; t0 = millis();
       int pct = (int)((received * 100UL) / contentLength);
       if (pct != lastPct && (pct % 5 == 0 || pct >= 99)) { LOGI("OTA", String("progress ") + pct + "%"); lastPct = pct; }
-    } else { feedLoopWDT(); delay(1); }
+    } else { feedWdt(); delay(1); }
   }
   if (received != contentLength) {
     httpSendHeaderOK(c, "application/json; charset=UTF-8");
@@ -1254,7 +1320,7 @@ static bool handleOTA(EthernetClient &c, size_t contentLength) {
 }
 
 // ==== JSON-API-Handler (schreibend -> Queues) ====
-static void apiFanSet(EthernetClient &c, const String &body) {
+static void apiFanSet(NetworkClient &c, const String &body) {
   String s; long idx = -1, pct = -1;
   if (formGet(body, F("idx"), s)) idx = s.toInt();
   if (formGet(body, F("pct"), s)) pct = s.toInt();
@@ -1265,20 +1331,33 @@ static void apiFanSet(EthernetClient &c, const String &body) {
   apiOk(c);
 }
 
-static void apiFanSave(EthernetClient &c, const String &body) {
+static void apiFanSave(NetworkClient &c, const String &body) {
   String s;
   if (!formGet(body, F("idx"), s) && !formGet(body, F("fan"), s)) { apiErr(c, "missing idx"); return; }
   int idx = s.toInt();
+  // §4.3: alle Namen EINMAL unter Lock snapshotten — applyDo (Control-Core) schreibt fans[].name
+  // parallel; sanitizeName liest das ganze Array (Multi-Byte) -> sonst torn read nach dem Split.
+  char names[MAX_FANS][20];
+  fansLock();
+  for (uint8_t i = 0; i < MAX_FANS; i++) { uint8_t n = 0; for (; n < 19 && fans[i].name[n]; n++) names[i][n] = fans[i].name[n]; names[i][n] = 0; }
+  fansUnlock();
+  bool isNew = (idx < 0);   // idx<0 => neuer Luefter: ersten freien Slot ERST HIER belegen (kein Phantom-Slot beim Klick)
+  if (isNew) {
+    idx = -1;
+    for (uint8_t i = 0; i < MAX_FANS; i++) if (names[i][0] == 0) { idx = (int)i; break; }
+    if (idx < 0) { apiErr(c, "no free slot"); return; }
+  }
   if (idx < 0 || idx >= MAX_FANS) { apiErr(c, "bad idx"); return; }
-  Fan &f = fans[idx];
+  Fan &f = fans[idx];   // nur fuer Einzelbyte-Felder (pwmPin/tachPin/invertPwm) — benigne Race
 
-  String newName = String(f.name);
+  String newName = String(names[idx]);
   if (formGet(body, F("name"), s)) newName = s;
+  { String rt = newName; rt.trim(); if (rt.isEmpty()) { apiErr(c, "name required"); return; } }  // kein leerer Name (sonst sanitize->"fan"-Fallback = unsichtbarer Geist)
   String cleanName = sanitizeName(newName);
   if (!fanNameValid(cleanName.c_str())) { apiErr(c, "invalid name"); return; }
-  for (uint8_t i = 0; i < MAX_FANS; i++) {  // Topic-Kollision (Spec §4)
-    if ((int)i == idx || !fanPresentIdx(i)) continue;
-    if (sanitizeName(fans[i].name) == cleanName) { apiErr(c, "name in use"); return; }
+  for (uint8_t i = 0; i < MAX_FANS; i++) {  // Topic-Kollision (Spec §4): gegen ALLE belegten Slots, nicht nur present-e
+    if ((int)i == idx || names[i][0] == 0) continue;
+    if (sanitizeName(String(names[i])) == cleanName) { apiErr(c, "name in use"); return; }
   }
 
   bool inv = f.invertPwm;  // Default = Ist-Zustand: fehlt das Feld (Nicht-UI-Client), bleibt invert erhalten
@@ -1288,55 +1367,48 @@ static void apiFanSave(EthernetClient &c, const String &body) {
   if (formGet(body, F("tach"), s)) newTac = (uint8_t)constrain(s.toInt(), 0, 255);
   if (newPwm != f.pwmPin && !validPwmForFan(newPwm,  (int8_t)idx)) { apiErr(c, "pwm pin invalid/busy"); return; }
   if (newTac != f.tachPin && !validTachForFan(newTac, (int8_t)idx)) { apiErr(c, "tach pin invalid/busy"); return; }
+  if (isNew && (newPwm == 0xFF || newTac == 0xFF)) { apiErr(c, "pins required"); return; }  // neuer Luefter braucht Pins
+  if (newPwm != 0xFF && newPwm == newTac) { apiErr(c, "pwm/tach pin gleich"); return; }     // ein GPIO kann nicht PWM UND Tacho
 
   ApplyJob j; j.idx = (uint8_t)idx;
-  if (sanitizeName(String(f.name)) != cleanName) { safeStrcpy(j.name, sizeof(j.name), cleanName); j.nameChanged = true; }
+  // isNew: Name IMMER schreiben — sonst bleibt bei cleanName=="fan" (leer/"Fan"/Sonderzeichen) nameChanged false
+  // und der Slot wuerde mit Pins, aber ohne Namen angelegt = unsichtbarer Geist (nicht present).
+  if (isNew || sanitizeName(String(names[idx])) != cleanName) { safeStrcpy(j.name, sizeof(j.name), cleanName); j.nameChanged = true; }
   if (inv != f.invertPwm) { j.invert = inv; j.invChanged = true; }
   if (newPwm != f.pwmPin || newTac != f.tachPin) { j.pwmPin = newPwm; j.tachPin = newTac; j.pinsChanged = true; }
   if (j.nameChanged || j.invChanged || j.pinsChanged) applyQueue((uint8_t)idx, j);
   apiOk(c);
 }
 
-static void apiFanDelete(EthernetClient &c, const String &body) {
+static void apiFanDelete(NetworkClient &c, const String &body) {
   String s;
   if (!formGet(body, F("idx"), s)) { apiErr(c, "missing idx"); return; }
   int idx = s.toInt();
-  if (idx < 0 || idx >= MAX_FANS || !fanPresentIdx((uint8_t)idx)) { apiErr(c, "bad idx"); return; }
+  // Jeder BELEGTE Slot (Name gesetzt) ist loeschbar — auch unkonfiguriert (ohne Pins).
+  if (idx < 0 || idx >= MAX_FANS || fans[idx].name[0] == 0) { apiErr(c, "bad idx"); return; }
   ApplyJob j; j.idx = (uint8_t)idx; j.deleteFan = true;
   applyQueue((uint8_t)idx, j);
   apiOk(c);
 }
 
-static void apiFanNew(EthernetClient &c, const String &body) {
-  (void)body;
-  int idx = -1;  // [B8] freie Slots an pwmPin==0xFF erkennen
-  for (uint8_t i = 0; i < MAX_FANS; i++) if (fans[i].pwmPin == 0xFF) { idx = i; break; }
-  if (idx < 0) { apiErr(c, "no free slot"); return; }
-  fanInitDefaults((uint8_t)idx);
-  clearFanNVS((uint8_t)idx);
-  safeStrcpy(fans[idx].name, sizeof(fans[idx].name), String("fan") + String(idx + 1));
-  g_stateRev++;
-  httpSendHeaderOK(c, "application/json; charset=UTF-8");
-  c.print(F("{\"ok\":true,\"idx\":")); c.print(idx); c.print(F("}"));
-}
-
-static void apiCalib(EthernetClient &c, const String &body) {
+static void apiCalib(NetworkClient &c, const String &body) {
   String s;
   if (!formGet(body, F("idx"), s)) { apiErr(c, "missing idx"); return; }
   int idx = s.toInt();
   if (idx < 0 || idx >= MAX_FANS || !fanPresentIdx((uint8_t)idx)) { apiErr(c, "bad idx"); return; }
-  Fan &f = fans[idx];
-  if (formGet(body, F("cmin"), s)) f.calMinStart = dutyFromPct((uint8_t)constrain(s.toInt(), 0, 100));
-  if (formGet(body, F("cnote"), s)) safeStrcpy(f.calNote, sizeof(f.calNote), s);
-  Preferences p; p.begin("fans", false);
-  String k = "f" + String(idx) + "_";
-  p.putUChar((k + "cmin").c_str(), f.calMinStart);
-  p.putString((k + "cnote").c_str(), f.calNote);
-  p.end();
+  // §4.4: kein direkter fans[]-Write mehr — ueber die Apply-Queue an den Control-Core leiten.
+  ApplyJob j; j.idx = (uint8_t)idx; j.calChanged = true;
+  fansLock();                                  // Default = Ist-Wert (fehlt ein Feld, bleibt er erhalten)
+  j.calMin = fans[idx].calMinStart;
+  { uint8_t n = 0; for (; n < sizeof(j.calNote) - 1 && fans[idx].calNote[n]; n++) j.calNote[n] = fans[idx].calNote[n]; j.calNote[n] = 0; }
+  fansUnlock();
+  if (formGet(body, F("cmin"),  s)) j.calMin = dutyFromPct((uint8_t)constrain(s.toInt(), 0, 100));
+  if (formGet(body, F("cnote"), s)) safeStrcpy(j.calNote, sizeof(j.calNote), s);
+  applyQueue((uint8_t)idx, j);
   apiOk(c);
 }
 
-static void apiMqttSave(EthernetClient &c, const String &body) {
+static void apiMqttSave(NetworkClient &c, const String &body) {
   String s;
   mqttConfig.enabled = body.indexOf(F("enabled=1")) >= 0;
   if (formGet(body, F("host"),   s)) safeStrcpy(mqttConfig.host,   sizeof(mqttConfig.host),   s);
@@ -1352,12 +1424,17 @@ static void apiMqttSave(EthernetClient &c, const String &body) {
   p.putString("pass",   mqttConfig.pass);
   p.putString("prefix", mqttConfig.prefix);
   p.end();
-  LOGI("MQTT", "config saved");
-  mqtt.disconnect();  // Reconnect mit neuer Konfig via Backoff
+  LOGI("MQTT", "config saved -> reboot");
   apiOk(c);
+  // esp-mqtt wird in setup() konfiguriert (kein sauberes Runtime-Reconfig) -> Neustart
+  // übernimmt die neue Konfig. Reboot ist rollback-sicher (Image ist valid).
+  c.flush();
+  prepareRestart();
+  delay(200);
+  esp_restart();
 }
 
-static void apiSafeModeReset(EthernetClient &c, const String &body) {
+static void apiSafeModeReset(NetworkClient &c, const String &body) {
   (void)body;
   Preferences p; p.begin("sys", false);
   p.putUChar("crash_streak", 0);
@@ -1366,7 +1443,7 @@ static void apiSafeModeReset(EthernetClient &c, const String &body) {
   apiOk(c);  // wirkt vollstaendig nach dem naechsten Reboot
 }
 
-static void apiReboot(EthernetClient &c, const String &body) {
+static void apiReboot(NetworkClient &c, const String &body) {
   (void)body;
   apiOk(c);
   c.flush();
@@ -1376,7 +1453,7 @@ static void apiReboot(EthernetClient &c, const String &body) {
 }
 
 // ==== Router ====
-static void handleClient(EthernetClient &c) {
+static void handleClient(NetworkClient &c) {
   g_reqStart = millis();  // [Spec §3.1] 10s-Gesamtbudget ab erster Zeile (OTA-Body liest direkt via c.read())
   String rl;
   if (!readLine(c, rl, CLIENT_RD_TIMEOUT)) return;
@@ -1404,7 +1481,6 @@ static void handleClient(EthernetClient &c) {
     if (path == "/api/fan/set")        { handleFormPost(c, contentLength, contentType, apiFanSet); return; }
     if (path == "/api/fan/save")       { handleFormPost(c, contentLength, contentType, apiFanSave); return; }
     if (path == "/api/fan/delete")     { handleFormPost(c, contentLength, contentType, apiFanDelete); return; }
-    if (path == "/api/fan/new")        { apiFanNew(c, String("")); return; }
     if (path == "/api/calib")          { handleFormPost(c, contentLength, contentType, apiCalib); return; }
     if (path == "/api/mqtt")           { handleFormPost(c, contentLength, contentType, apiMqttSave); return; }
     if (path == "/api/safemode/reset") { apiSafeModeReset(c, String("")); return; }
@@ -1420,9 +1496,7 @@ static void handleClient(EthernetClient &c) {
 }
 
 // ==== Ethernet State ====
-static unsigned long lastDhcpTryMs = 0;
 static uint32_t g_linkLostSince = 0, g_lastEthReinit = 0;
-static uint32_t g_lastEthMaintainMs = 0;
 
 // ==== setup() helpers ====
 static void ledcInitAllPresentToZero() {
@@ -1456,11 +1530,64 @@ static void restoreSavedDuties() {
   if (restored > 0) LOGI("STATE", String("restored ") + restored + " duty values from NVS");
 }
 
+// §5.3: Netz-Task auf Core 0 — Link-Watch + HTTP + Telemetrie-/Log-Drains.
+// Der Control-Loop bleibt im Arduino-loopTask (Core 1). Dieser Task wird beim TWDT abonniert,
+// damit ein Hang (z.B. W5500-SPI, §12A) zum Panic-Reboot -> Bootloader-Rollback fuehrt.
+static void networkTask(void *arg) {
+  (void)arg;
+  esp_task_wdt_add(nullptr);
+  for (;;) {
+    esp_task_wdt_reset();
+    g_netCtr.fetch_add(1);
+    uint32_t now = millis();
+
+    // Netz-Status aus async ETH-Events
+    bool ipNow = ethHasIp();
+    if (ipNow && !httpUp.load()) { httpServer.begin(); ethStartMdns(); httpUp.store(true); LOGI("NET", String("IP: ") + ethLocalIp()); }
+    if (!ipNow && httpUp.load() && !ethLinkUp()) httpUp.store(false);   // Link weg -> Server pausiert
+    ethHasIP = ipNow;
+    // Link > 15 s weg -> harter Treiber-Reset (Cooldown 5 s). DHCP-Lease erneuert esp-netif selbst.
+    if (!ethLinkUp()) {
+      if (g_linkLostSince == 0) g_linkLostSince = now;
+      if (elapsed(now, g_linkLostSince, ETH_LINK_LOST_RESET_MS) && elapsed(now, g_lastEthReinit, ETH_REINIT_COOLDOWN_MS)) {
+        LOGW("NET", "link down >15s -> ETH hard reset");
+        g_lastEthReinit = now;
+        httpUp.store(false);
+        ethHardReset();
+      }
+    } else {
+      g_linkLostSince = 0;
+    }
+
+    // HTTP
+    if (httpUp.load() && ethHasIP) {
+      NetworkClient c = httpServer.accept();
+      if (c) {
+        uint32_t t0 = millis();
+        while (c.connected() && !c.available() && !elapsed(millis(), t0, 400)) { feedWdt(); delay(1); }
+        if (!c.available()) c.stop();
+        else { handleClient(c); delay(1); c.stop(); }
+      }
+    }
+
+    telemDrain();   // Telemetrie -> MQTT publishen (Netz-Kontext)
+    logDrain();     // Log-Queue -> gLogBuf
+    delay(2);
+  }
+}
+
 // ==== setup() ====
 void setup() {
   Serial.begin(115200);
   delay(200);
-  Serial.println(F("== ESP32-S3-ETH Fan Controller v4.0 =="));
+  Serial.println(F("== ESP32-S3-ETH Fan Controller v" FW_VERSION " =="));
+
+  // §4: Cross-Core-Queues + fans[]-/Cleanup-Mutex VOR allem anderen anlegen (esp-mqtt-Task
+  // startet erst mit loopStart() weiter unten; Log-Queue (spaeter) faengt ab hier alle LOGs).
+  concurrencyInit();
+  g_applyQ = xQueueCreate(MAX_FANS, sizeof(ApplyJob));   // hier, da sizeof(ApplyJob) erst im Sketch sichtbar
+  fansMutex = xSemaphoreCreateMutex();
+  logMutex  = xSemaphoreCreateMutex();
 
   // Anti-Brick: Task-WDT bleibt AKTIV und ueberwacht den Loop-Task.
   // 8 s Budget; Panic => Reboot => ggf. Bootloader-Rollback (Spec §3.1/3.2).
@@ -1478,7 +1605,7 @@ void setup() {
     esp_ota_img_states_t st;
     if (esp_ota_get_state_partition(running, &st) == ESP_OK &&
         st == ESP_OTA_IMG_PENDING_VERIFY) {
-      g_otaPendingVerify = true;
+      g_otaPendingVerify.store(true);
       LOGW("OTA", "Image PENDING_VERIFY - Health-Window 90s laeuft");
     }
   }
@@ -1494,9 +1621,8 @@ void setup() {
 
   loadConfigFans();
   loadMQTTConfig();
-  mqtt.setSocketTimeout(3);  // CONNACK-Busy-Wait < WDT-Budget (Spec §3.1)
   buildMacAndDeviceId();
-  dutyPendingInit();
+  // (Duty-Queue wird in concurrencyInit() oben angelegt — kein separates Init mehr)
 
   // Hardware auf 0, dann Tach-Pullups
   ledcInitAllPresentToZero();
@@ -1518,100 +1644,80 @@ void setup() {
   }
   dutyProcessQueue();
 
-  // [B7] W5500 Ethernet — resetW5500() macht SPI.begin + Ethernet.init
-  // [Review-Fund D] WDT um die langsamen Schritte (W5500-Reset ~250ms, DHCP bis 4s)
-  // explizit fuettern: enableLoopWDT() ist aktiv, setup() laeuft im Loop-Task (8s-Budget).
-  feedLoopWDT();
-  resetW5500();
-  feedLoopWDT();
+  // [Stufe2/1] Nativer W5500-Treiber (ETH.h). DHCP laeuft async; das GOT_IP-Event
+  // setzt g_ethHasIp; httpServer wird in loop() gestartet, sobald die IP da ist.
+  feedWdt();
+  if (!ethBegin()) LOGE("NET", "ETH.begin failed");
+  feedWdt();
 
-  if (Ethernet.begin(g_mac, 4000, 1200)) {
-    ethHasIP = true;
-    httpServer.begin();
-    httpUp = true;
-    LOGI("NET", String("W5500 OK - IP: ") + Ethernet.localIP().toString());
-  } else {
-    ethHasIP = false;
-    LOGW("NET", "DHCP failed - retry in loop()");
+  // [Stufe2/2] esp-mqtt zuletzt starten (Task läuft eigenständig, Auto-Reconnect; onMqttConnect
+  // feuert erst, wenn alles oben initialisiert ist). Nur wenn aktiviert + nicht im Safe-Mode.
+  // Client-ID/LWT-Topic in globalen Strings halten — die Lib speichert nur den Pointer.
+  if (mqttConfig.enabled && strlen(mqttConfig.host) > 0 && !g_crashLoopDetected) {
+    g_mqttClientId = deviceId + "-cli";
+    g_mqttLwtTopic = topicDev() + "/status";
+    mqtt.setMqttClientName(g_mqttClientId.c_str());
+    if (strlen(mqttConfig.user) > 0) mqtt.setURL(mqttConfig.host, mqttConfig.port, mqttConfig.user, mqttConfig.pass);
+    else                             mqtt.setURL(mqttConfig.host, mqttConfig.port);
+    mqtt.enableLastWillMessage(g_mqttLwtTopic.c_str(), "offline", true);
+    mqtt.setKeepAlive(30);
+    mqtt.loopStart();
+    LOGI("MQTT", String("esp-mqtt -> ") + mqttConfig.host + ":" + mqttConfig.port);
   }
 
   LOGI("BOOT", "Setup complete.");
+  logDrain();   // §4.6: Setup-Log-Burst aus der Queue in gLogBuf flushen (vor Task-Start)
+
+  // §5.3: Netz-Task auf Core 0 starten (Control bleibt loopTask/Core 1, anderer Core -> keine
+  // Prio-Konkurrenz). Stack 8 KB konservativ (HTTP, kein TLS) -> in Stufe 9 per
+  // uxTaskGetStackHighWaterMark pruefen. Prio 5 = wie der esp-mqtt-Task (beide auf Core 0; net
+  // yieldet per delay(2), daher keine MQTT-Starvation).
+  xTaskCreatePinnedToCore(networkTask, "net", 8192, nullptr, 5, &g_netTaskHandle, 0);
 }
 
 // ==== loop() ====
 void loop() {
   static uint32_t lastMeasureTick = 0;
   const uint32_t now = millis();
+  g_loopCtr.fetch_add(1);   // §8: Control-Loop-Liveness (Heartbeat)
 
-  // [Spec §3.2] Health-Window: 90s am Stueck gesund gelaufen => Image valid, Rollback abgewaehlt.
-  // (Ein bewusster Reboot/OTA innerhalb der 90s markiert ebenfalls valid, siehe commitIfPending.)
-  if (g_otaPendingVerify && now > OTA_HEALTH_MS) commitIfPending();
+  // [Stufe2/1 + Stufe3] Netz-gebundenes Health-Window. NACH dem Dual-Core-Split beweist "IP da"
+  // allein NICHT mehr Erreichbarkeit: der W5500-Treiber-Task haelt die IP auch dann, wenn der
+  // networkTask defekt ist (Stack/HTTP-begin) -> sonst Soft-Brick. Daher Commit nur mit POSITIVEM
+  // Beweis: HTTP hochgebracht (httpUp) UND networkTask tickt (Heartbeat in den letzten 5s).
+  // Crash/Hang des networkTask faengt separat der TWDT (Panic-Reboot). Nie erreichbar bis 120s
+  // -> Selbst-Neustart OHNE commit -> Bootloader-Rollback aufs vorherige Image.
+  if (g_otaPendingVerify.load()) {
+    static uint32_t lastNetCtr = 0, lastNetChkMs = 0;
+    static bool netTicking = false;
+    if (lastNetChkMs == 0) lastNetChkMs = now;
+    if (elapsed(now, lastNetChkMs, 5000)) {
+      uint32_t nc = g_netCtr.load();
+      netTicking = (nc != lastNetCtr);
+      lastNetCtr = nc; lastNetChkMs = now;
+    }
+    bool reachable = ethHasIp() && httpUp.load() && netTicking;
+    if (now > OTA_HEALTH_MS && reachable) {
+      commitIfPending();
+    } else if (now > 120000UL && !reachable) {
+      LOGE("OTA", "nicht erreichbar (IP+HTTP+net-heartbeat) in 120s -> Selbst-Neustart, Rollback aufs vorherige Image");
+      persistLogTail();
+      delay(100);
+      esp_restart();   // ohne commit -> PENDING_VERIFY bleibt -> Bootloader-Rollback
+    }
+  }
 
   uint32_t hf = ESP.getFreeHeap();
-  if (hf < g_minFreeHeap) g_minFreeHeap = hf;
+  if (hf < g_minFreeHeap.load()) g_minFreeHeap.store(hf);
 
   // --- Apply-Queue ---
-  if (g_anyApplyPending) {
-    bool stillPending = false;
-    for (uint8_t i = 0; i < MAX_FANS; i++) {
-      if (g_apply[i].active) {
-        applyDo(i);
-        if (g_apply[i].active) stillPending = true;
-      }
-    }
-    g_anyApplyPending = stillPending;
-  }
+  { ApplyJob j;
+    while (g_applyQ && xQueueReceive(g_applyQ, &j, 0) == pdTRUE) applyDo(j); }
 
   // --- Duty-Queue ---
   dutyProcessQueue();
 
-  // --- Ethernet/DHCP/Link-Watch ---
-  if (!ethHasIP) {
-    if (Ethernet.linkStatus() == LinkON && (now - lastDhcpTryMs) > DHCP_RETRY_MS) {
-      lastDhcpTryMs = now;
-      if (Ethernet.begin(g_mac, 4000, 1200)) {
-        ethHasIP = true;
-        if (!httpUp) { httpServer.begin(); httpUp = true; }
-        LOGI("NET", String("IP: ") + Ethernet.localIP().toString());
-      } else {
-        LOGW("NET", "DHCP retry failed");
-      }
-    }
-  } else {
-    if (now - g_lastEthMaintainMs >= ETH_MAINTAIN_INTERVAL_MS) {
-      g_lastEthMaintainMs = now;
-      Ethernet.maintain();
-    }
-    if (Ethernet.linkStatus() != LinkON) {
-      if (g_linkLostSince == 0) g_linkLostSince = now;
-      if ((now - g_linkLostSince) > ETH_LINK_LOST_RESET_MS && (now - g_lastEthReinit) > ETH_REINIT_COOLDOWN_MS) {
-        LOGW("NET", "Link down too long -> W5500 reset");
-        ethHasIP = false;
-        mqttWasConnected = false;
-        g_lastEthReinit = now;
-        resetW5500();
-      }
-    } else {
-      g_linkLostSince = 0;
-    }
-  }
-
-  // --- HTTP Server ---
-  if (httpUp && ethHasIP) {
-    EthernetClient c = httpServer.available();
-    if (c) {
-      unsigned long t0 = now;
-      while (c.connected() && !c.available() && !elapsed(millis(), t0, 400)) { feedLoopWDT(); delay(1); }
-      if (!c.available()) c.stop();
-      else { handleClient(c); delay(1); c.stop(); }
-    }
-  }
-
-  // --- MQTT ---
-  if (mqttConfig.enabled && ethHasIP && !g_crashLoopDetected) {
-    mqttEnsureConnected();
-    if (mqtt.connected()) mqtt.loop();
-  }
+  // --- Netz (Link-Watch + HTTP) + MQTT laufen jetzt im networkTask (Core 0) bzw. esp-mqtt-Task ---
 
   // --- Storm-Recovery ---
   for (uint8_t i = 0; i < MAX_FANS; i++) {
@@ -1691,7 +1797,7 @@ void loop() {
 
       if (f.burstLeft > 0) f.burstLeft--;
 
-      mqttPublishRPM(i, false);
+      telemPostRpm(i);   // §4.1: Telemetrie in die Queue (Netz-Task published)
     }
   }
 

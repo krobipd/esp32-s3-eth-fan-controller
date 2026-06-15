@@ -50,7 +50,7 @@ hr{border:0;border-top:1px solid var(--bd);margin:16px 0}
 border-radius:6px;padding:10px 14px;display:none;font-size:12px}
 </style></head><body><div class="wrap">
 <header>
-  <h1>FAN-CTRL <small id="dev">—</small></h1>
+  <h1>FAN-CTRL <small id="ver">—</small> <small id="dev">—</small></h1>
   <div class="leds">
     <span class="led" id="l-eth">ETH</span><span class="led" id="l-mqtt">MQTT</span>
     <span class="led" id="l-wdt">WDT</span><span id="l-ip" class="muted"></span>
@@ -79,18 +79,19 @@ border-radius:6px;padding:10px 14px;display:none;font-size:12px}
   <section id="t-cfg" style="display:none"><div class="row">
     <div class="col"><h3 class="small" style="letter-spacing:.1em">LÜFTER</h3>
       <div class="list" id="fanlist"></div>
-      <button class="btn" onclick="api('/api/fan/new',{},j=>poll(true).then(()=>{editFan(j.idx);toast('Neuer Slot — bitte Pins zuweisen')}))">+ Neuer Lüfter</button>
+      <button class="btn" onclick="newFan()">+ Neuer Lüfter</button>
       <div id="editbox" style="display:none"><hr>
-        <h3 class="small">LÜFTER #<span id="e-idx"></span> BEARBEITEN</h3>
+        <h3 class="small">LÜFTER <span id="e-idx"></span></h3>
         <label>NAME (a-z 0-9 _ -)</label><input type="text" id="e-name" maxlength="19">
         <label>PWM-PIN</label><select id="e-pwm"></select>
         <label>TACHO-PIN</label><select id="e-tach"></select>
         <label><input type="checkbox" id="e-inv" style="width:auto"> PWM invertieren</label>
         <button class="btn" onclick="saveFan()">Speichern</button>
+        <div id="editonly">
         <button class="btn danger" onclick="delFan()">Löschen</button>
         <label>KALIBRIERUNG: MIN-START (%)</label><input type="number" id="e-cmin" min="0" max="100" value="0">
         <label>NOTIZ</label><input type="text" id="e-note" maxlength="39">
-        <button class="btn" onclick="saveCalib()">Kalibrierung speichern</button></div></div>
+        <button class="btn" onclick="saveCalib()">Kalibrierung speichern</button></div></div></div>
     <div class="col"><h3 class="small" style="letter-spacing:.1em">MQTT</h3>
       <label><input type="checkbox" id="m-en" style="width:auto"> aktiv</label>
       <label>HOST</label><input type="text" id="m-host">
@@ -146,7 +147,7 @@ function renderDash(){const g=$("fangrid");const fans=(J.fans||[]).filter(f=>f.p
   if(sl&&document.activeElement!==sl){sl.value=f.pct;const p=$("p"+f.index);if(p)p.textContent=f.pct;}});}
 function renderSys(){const fmt=s=>{const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);
   return(d?d+"d ":"")+h+"h "+m+"m"};
- $("syskv").innerHTML=[["Device",esc(J.device)],["IP",esc(J.ip)],["Uptime",fmt(J.uptime_s||0)],
+ $("syskv").innerHTML=[["Firmware","v"+esc(J.fw_version||"?")],["Device",esc(J.device)],["IP",esc(J.ip)],["Uptime",fmt(J.uptime_s||0)],
   ["Boot-Count",J.boot_count],["Reset-Grund",esc(J.reset_reason)],["Crash-Streak",J.crash_streak],
   ["Watchdog",J.wdt?"AKTIV":"AUS!"],["OTA",J.ota_pending?"PENDING_VERIFY (Health-Window)":"validiert"],
   ["Min Free Heap",J.min_free_heap],["Largest Block",J.largest_block]]
@@ -167,11 +168,17 @@ function pinOpts(sel,list,current){sel.innerHTML="";[...new Set([current,...list
  .forEach(p=>{const o=document.createElement("option");o.value=p;o.textContent="GPIO "+p;
   if(p===current)o.selected=true;sel.appendChild(o);});}
 function editFan(i){editIdx=i;const f=(J.fans||[]).find(x=>x.index===i);if(!f)return;
- $("editbox").style.display="";$("e-idx").textContent=i;$("e-name").value=f.name;
+ $("editbox").style.display="";$("editonly").style.display="";$("e-idx").textContent="#"+(i+1)+" BEARBEITEN";$("e-name").value=f.name;
  pinOpts($("e-pwm"),J.free_pwm||[],f.pwmPin);pinOpts($("e-tach"),J.free_tach||[],f.tachPin);
  $("e-inv").checked=!!f.inv;$("e-cmin").value=f.cmin??0;$("e-note").value=f.cnote??"";}
-function saveFan(){api("/api/fan/save",{idx:editIdx,name:$("e-name").value,pwm:$("e-pwm").value,
- tach:$("e-tach").value,inv:$("e-inv").checked?1:0},()=>{toast("Gespeichert");poll(true);});}
+function newFan(){editIdx=-1;$("editbox").style.display="";$("editonly").style.display="none";$("e-idx").textContent="ANLEGEN";
+ $("e-name").value="";pinOpts($("e-pwm"),J.free_pwm||[],undefined);pinOpts($("e-tach"),J.free_tach||[],undefined);
+ const pw=$("e-pwm").value,ts=$("e-tach");for(let k=0;k<ts.options.length;k++){if(ts.options[k].value!==pw){ts.selectedIndex=k;break;}} // Default: Tacho!=PWM
+ $("e-inv").checked=false;}
+function saveFan(){const nm=$("e-name").value.trim();if(!nm){toast("Name fehlt");return;}
+ if($("e-pwm").value===$("e-tach").value){toast("PWM- und Tacho-Pin müssen verschieden sein");return;}
+ api("/api/fan/save",{idx:editIdx,name:nm,pwm:$("e-pwm").value,
+ tach:$("e-tach").value,inv:$("e-inv").checked?1:0},()=>{toast("Gespeichert");if(editIdx<0)$("editbox").style.display="none";poll(true);});}
 function delFan(){if(confirm("Lüfter wirklich löschen?"))
  api("/api/fan/delete",{idx:editIdx},()=>{$("editbox").style.display="none";toast("Gelöscht");poll(true);});}
 function saveCalib(){api("/api/calib",{idx:editIdx,cmin:$("e-cmin").value,cnote:$("e-note").value},()=>toast("Kalibrierung gespeichert"));}
@@ -199,7 +206,7 @@ function watchReboot(){const b0=J?J.boot_count:0,t0=Date.now();
 function poll(force){return fetch("/api/status",{cache:"no-store"}).then(r=>r.json()).then(j=>{
   J=j;fail=0;$("l-eth").classList.add("on");
   $("l-mqtt").classList.toggle("on",!!j.mqtt_connected);$("l-wdt").classList.toggle("on",!!j.wdt);
-  $("dev").textContent=j.device||"—";$("l-ip").textContent=j.ip||"";
+  $("dev").textContent=j.device||"—";$("ver").textContent=j.fw_version?("v"+j.fw_version):"";$("l-ip").textContent=j.ip||"";
   $("safebanner").style.display=j.safe_mode?"":"none";
   renderDash();renderSys();if(force||$("t-cfg").style.display==="")renderCfg();})
  .catch(()=>{if(++fail>=3){$("l-eth").classList.remove("on");$("l-mqtt").classList.remove("on");}});}

@@ -57,9 +57,8 @@ und werden im Hauptloop abgearbeitet (entkoppelt von der Hardware).
 | Pfad | Felder | Wirkung |
 |---|---|---|
 | `/api/fan/set` | `idx`, `pct` (0–100) | Leistung setzen |
-| `/api/fan/save` | `idx`, `name`, `pwm`, `tach`, `inv` (0/1) | Lüfter anlegen/ändern |
-| `/api/fan/delete` | `idx` | Lüfter löschen |
-| `/api/fan/new` | – | freien Slot anlegen → `{"ok":true,"idx":N}` |
+| `/api/fan/save` | `idx`, `name`, `pwm`, `tach`, `inv` (0/1) | Lüfter ändern; **`idx=-1` legt einen neuen an** (belegt ersten freien Slot, `name`+Pins Pflicht) |
+| `/api/fan/delete` | `idx` | Lüfter löschen (jeder belegte Slot) |
 | `/api/calib` | `idx`, `cmin` (0–100), `cnote` | Kalibrierung speichern |
 | `/api/mqtt` | `enabled`, `host`, `port`, `user`, `pass`, `prefix` | MQTT-Konfig (leeres `pass` lässt das alte stehen) |
 | `/api/safemode/reset` | – | Crash-Streak/Safe-Mode zurücksetzen (wirkt nach Reboot) |
