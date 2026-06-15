@@ -1,7 +1,7 @@
 /**************************************************************
- * WAVESHARE ESP32-S3-ETH Fan Controller v4.0 (Stufe 1: Haertung + neues UI)
+ * WAVESHARE ESP32-S3-ETH Fan Controller v5.0 (Dual-Core: native ETH.h + esp-mqtt + Core-Split)
  * Board: Waveshare ESP32-S3-ETH (W5500 via SPI2, PoE)
- * Arduino IDE 2.3.7 | ESP32 Arduino Core 3.3.5
+ * Arduino IDE 2.3.7 | ESP32 Arduino Core 3.3.8
  * W5500 Pins: MISO=12, MOSI=11, SCLK=13, CS=14, RST=9
  * Board-Setting: "USB CDC On Boot: Enabled" ist PFLICHT
  **************************************************************/
@@ -1574,7 +1574,7 @@ static void networkTask(void *arg) {
 void setup() {
   Serial.begin(115200);
   delay(200);
-  Serial.println(F("== ESP32-S3-ETH Fan Controller v4.0 =="));
+  Serial.println(F("== ESP32-S3-ETH Fan Controller v5.0 =="));
 
   // §4: Cross-Core-Queues + fans[]-/Cleanup-Mutex VOR allem anderen anlegen (esp-mqtt-Task
   // startet erst mit loopStart() weiter unten; Log-Queue (spaeter) faengt ab hier alle LOGs).
@@ -1680,7 +1680,7 @@ void loop() {
   // networkTask defekt ist (Stack/HTTP-begin) -> sonst Soft-Brick. Daher Commit nur mit POSITIVEM
   // Beweis: HTTP hochgebracht (httpUp) UND networkTask tickt (Heartbeat in den letzten 5s).
   // Crash/Hang des networkTask faengt separat der TWDT (Panic-Reboot). Nie erreichbar bis 120s
-  // -> Selbst-Neustart OHNE commit -> Bootloader-Rollback auf v4.0.
+  // -> Selbst-Neustart OHNE commit -> Bootloader-Rollback aufs vorherige Image.
   if (g_otaPendingVerify.load()) {
     static uint32_t lastNetCtr = 0, lastNetChkMs = 0;
     static bool netTicking = false;
@@ -1694,7 +1694,7 @@ void loop() {
     if (now > OTA_HEALTH_MS && reachable) {
       commitIfPending();
     } else if (now > 120000UL && !reachable) {
-      LOGE("OTA", "nicht erreichbar (IP+HTTP+net-heartbeat) in 120s -> Selbst-Neustart, Rollback auf v4.0");
+      LOGE("OTA", "nicht erreichbar (IP+HTTP+net-heartbeat) in 120s -> Selbst-Neustart, Rollback aufs vorherige Image");
       persistLogTail();
       delay(100);
       esp_restart();   // ohne commit -> PENDING_VERIFY bleibt -> Bootloader-Rollback
