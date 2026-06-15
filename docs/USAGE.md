@@ -2,7 +2,8 @@
 
 Nach dem ersten Boot holt sich das Gerät per DHCP eine IP (Ethernet, kein WLAN). Die
 IP steht im Serial-Log; alternativ im Router nachsehen (Hostname/MAC) oder per MQTT
-(`<prefix>/<deviceId>/status` wird „online").
+(`<prefix>/<deviceId>/info/status` wird „online", `…/info/ip` zeigt die aktuelle IP).
+Die laufende Firmware-Version steht oben in der Web-UI und unter `…/info/version`.
 
 Die Weboberfläche erreichst du unter **`http://<geräte-ip>/`**.
 

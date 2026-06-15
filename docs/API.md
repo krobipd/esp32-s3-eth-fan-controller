@@ -5,9 +5,9 @@ Endpunkte erwarten `application/x-www-form-urlencoded` und antworten mit
 `{"ok":true}` bzw. `{"ok":false,"error":"…"}`. Schreibzugriffe füllen intern nur Queues
 und werden im Hauptloop abgearbeitet (entkoppelt von der Hardware).
 
-> **Keine Authentifizierung** (Stufe 1). Das Gerät gehört in ein vertrauenswürdiges LAN —
-> wer es erreicht, kann es steuern und flashen. (Auth ist ein Stufe-2-Thema; ein
-> Passwort-Lockout wäre bei einem Gerät ohne USB-Rettung selbst ein Risiko.)
+> **Keine Authentifizierung.** Das Gerät gehört in ein vertrauenswürdiges LAN — wer es erreicht,
+> kann es steuern und flashen. (Ein Passwort-Lockout wäre bei einem Gerät ohne USB-Rettung
+> selbst ein Risiko, daher bewusst nicht standardmäßig aktiv.)
 
 ## GET
 
@@ -23,6 +23,7 @@ und werden im Hauptloop abgearbeitet (entkoppelt von der Hardware).
 ```json
 {
   "rev": 3,
+  "fw_version": "5.2.0",
   "device": "ws-s3eth-1A2B3C",
   "ip": "10.0.0.42",
   "mqtt_connected": true,
@@ -35,6 +36,9 @@ und werden im Hauptloop abgearbeitet (entkoppelt von der Hardware).
   "min_free_heap": 201000,
   "largest_block": 198000,
   "uptime_s": 3600,
+  "core1_loops": 1234567,
+  "net_loops": 1234890,
+  "net_stack_hwm": 4304,
   "mqtt": { "enabled": true, "host": "10.0.0.5", "port": 1883, "user": "iob", "prefix": "esp" },
   "free_pwm":  [1,2,8,15,16,17,18,21,33,34,39,48],
   "free_tach": [1,2,8,15,16,17,18,21,33,34,39,48],
@@ -46,6 +50,9 @@ und werden im Hauptloop abgearbeitet (entkoppelt von der Hardware).
 }
 ```
 
+- `fw_version` = laufende Firmware-Version (Semver, einzige Quelle im Code).
+- `core1_loops`/`net_loops` = Heartbeats der beiden Cores (Control-Loop bzw. Netz-Task) — beide müssen
+  steigen; `net_stack_hwm` = freier Netz-Task-Stack in Bytes (Liveness/Diagnose des Dual-Core-Betriebs).
 - `pwm` = roher 8-bit-Duty (0–255), `pct` = davon abgeleitete Prozent (0–100).
 - `present` = vollständig konfiguriert (Name + beide Pins). Unkonfigurierte, aber angelegte
   Slots erscheinen mit `present:false` (zum Bearbeiten).

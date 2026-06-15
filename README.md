@@ -47,7 +47,9 @@ Home-Automation (z. B. ioBroker) per MQTT übernehmen.
 ## MQTT in Kürze
 
 ```
-<prefix>/<deviceId>/status        online/offline   (retained, Last-Will)
+<prefix>/<deviceId>/info/status   online/offline   (retained, Last-Will)
+<prefix>/<deviceId>/info/version  Firmware-Version (retained)
+<prefix>/<deviceId>/info/ip       aktuelle IP      (retained)
 <prefix>/<deviceId>/<fan>/speed    Ist-Stellwert 0–100 %   (retained)
 <prefix>/<deviceId>/<fan>/set      Befehl 0–100
 <prefix>/<deviceId>/<fan>/rpm      Drehzahl

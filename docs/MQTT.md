@@ -6,20 +6,26 @@ Das Gerät verbindet sich als Client zu einem MQTT-Broker (Konfiguration im Web-
 
 ## Topic-Schema
 
-Flach, pro Lüfter genau drei Datenpunkte direkt unter dem (klein geschriebenen) Lüfternamen:
+Flach: Geräte-Info unter `info/`, pro Lüfter drei Datenpunkte unter dem (klein geschriebenen) Lüfternamen:
 
 ```
-<prefix>/<deviceId>/status            online / offline   (retained, Last-Will)
+<prefix>/<deviceId>/info/status        online / offline        (retained, Last-Will)
+<prefix>/<deviceId>/info/version       Firmware-Version (z. B. 5.2.0)   (retained)
+<prefix>/<deviceId>/info/ip            aktuelle IP-Adresse     (retained)
 <prefix>/<deviceId>/<fan>/speed        Ist-Stellwert 0–100 %   (retained)
 <prefix>/<deviceId>/<fan>/set          Befehl 0–100            (kein Retain)
 <prefix>/<deviceId>/<fan>/rpm          Drehzahl
 ```
 
+`status`, `sys` und `info` sind als Lüfternamen reserviert (kollidieren nicht mit `info/`).
+
 Beispiel (prefix `esp`, Lüfter `nas`):
 
 | Topic | Richtung | Wert |
 |---|---|---|
-| `esp/ws-s3eth-1A2B3C/status` | Gerät → Broker | `online` (retained), `offline` (Last-Will) |
+| `esp/ws-s3eth-1A2B3C/info/status` | Gerät → Broker | `online` (retained), `offline` (Last-Will) |
+| `esp/ws-s3eth-1A2B3C/info/version` | Gerät → Broker | z. B. `5.2.0` (retained) |
+| `esp/ws-s3eth-1A2B3C/info/ip` | Gerät → Broker | z. B. `10.0.0.42` (retained) |
 | `esp/ws-s3eth-1A2B3C/nas/speed` | Gerät → Broker | z. B. `58` (Ist-%, retained) |
 | `esp/ws-s3eth-1A2B3C/nas/rpm` | Gerät → Broker | z. B. `864` |
 | `esp/ws-s3eth-1A2B3C/nas/set` | Broker → Gerät | `0`–`100` (Sollwert in %) |
@@ -35,7 +41,7 @@ Wichtig:
 ## Beispiel: ioBroker
 
 Der MQTT-Adapter (Broker- oder Client-Modus) legt eingehende Topics **automatisch** als
-Objekte an — für `speed`/`rpm`/`status` ist also nichts zu konfigurieren. Aus
+Objekte an — für `info/*` und `speed`/`rpm` ist also nichts zu konfigurieren. Aus
 `esp/ws-s3eth-1A2B3C/nas/speed` wird das Objekt:
 
 ```
