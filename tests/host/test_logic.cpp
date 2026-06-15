@@ -15,7 +15,7 @@ int main() {
   // Namen: nur a-z 0-9 _ - , 1..19 Zeichen, reservierte verboten
   assert(fanNameValid("nas"));  assert(fanNameValid("fan_2-x"));
   assert(!fanNameValid(""));    assert(!fanNameValid("NAS"));
-  assert(!fanNameValid("status")); assert(!fanNameValid("sys"));
+  assert(!fanNameValid("status")); assert(!fanNameValid("sys")); assert(!fanNameValid("info"));
   assert(!fanNameValid("zu-lang-1234567890123"));
 
   // §18: RAM-only Pending-Cleanup-Liste — verwaiste retained Topics bei MQTT-disconnect merken
