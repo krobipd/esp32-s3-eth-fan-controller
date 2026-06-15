@@ -1,5 +1,5 @@
 /**************************************************************
- * WAVESHARE ESP32-S3-ETH Fan Controller v5.3.0 (Dual-Core + info/ MQTT + UI Hell/Dunkel + HA-Discovery)
+ * WAVESHARE ESP32-S3-ETH Fan Controller v5.3.1 (HA-Discovery: bei AUS kein homeassistant/-Traffic mehr)
  * Version = FW_VERSION (einzige Quelle der Wahrheit, weiter unten) — Banner/UI/API lesen daraus.
  * Board: Waveshare ESP32-S3-ETH (W5500 via SPI2, PoE)
  * Arduino IDE 2.3.7 | ESP32 Arduino Core 3.3.8
@@ -53,7 +53,7 @@ static const uint32_t OTA_HEALTH_MS = 90000;
 // ==== Limits & Timing ====
 // ==== Version (Semver, EINZIGE Quelle der Wahrheit) ====
 // Bumpen + git-Tag vX.Y.Z müssen zusammenpassen. MAJOR=Architektur/Breaking, MINOR=Feature, PATCH=Fix.
-#define FW_VERSION "5.3.0"
+#define FW_VERSION "5.3.1"
 
 static const uint8_t  MAX_FANS              = 8;
 // §4.7: Arduino-loopTask laeuft auf Core 1 = Control-Core. ISR-/PCNT-/LEDC-Registrierung MUSS
@@ -890,13 +890,13 @@ void onMqttConnect(esp_mqtt_client_handle_t client) {
     String base = topicDev() + "/" + snap.names[k];
     mqtt.publish((base + "/speed").c_str(), "", 0, true);
     mqtt.unsubscribe((base + "/set").c_str());
-    haClearName(String(snap.names[k]));   // §5.5: verwaiste HA-Entitaeten mitraeumen
+    if (mqttConfig.haDisc) haClearName(String(snap.names[k]));   // §5.5: nur bei HA an
   }
   for (uint8_t i = 0; i < MAX_FANS; i++) {
     if (!fanPresentIdx(i)) continue;
     mqttSubscribeFan(i);
     mqttPublishSpeed(i);
-    haDiscoveryFan(i, mqttConfig.haDisc);   // §5.5: an -> Config publishen, aus -> leeren (Cleanup nach Toggle)
+    if (mqttConfig.haDisc) haDiscoveryFan(i, true);   // §5.5: NUR bei HA an publishen — sonst homeassistant/ NIE anfassen
   }
   LOGI("MQTT", "connected");
 }
@@ -926,7 +926,7 @@ static void applyDo(ApplyJob &j) {
         String baseOld = topicDev() + "/" + sname;
         mqtt.publish((baseOld + "/speed").c_str(), "", 0, true);
         mqtt.unsubscribe((baseOld + "/set").c_str());
-        haClearName(sname);   // §5.5: HA-Entitaeten des geloeschten Luefters entfernen
+        if (mqttConfig.haDisc) haClearName(sname);   // §5.5: nur bei HA an
       } else {
         pendingCleanupQueue(sname.c_str());   // §18: bei Disconnect vormerken -> onMqttConnect raeumt nach (inkl. HA)
       }
@@ -958,7 +958,7 @@ static void applyDo(ApplyJob &j) {
         String oldBase = topicDev() + "/" + sname;
         mqtt.publish((oldBase + "/speed").c_str(), "", 0, true);
         mqtt.unsubscribe((oldBase + "/set").c_str());
-        haClearName(sname);   // §5.5: alte HA-Entitaeten entfernen (neuer Name kommt unten)
+        if (mqttConfig.haDisc) haClearName(sname);   // §5.5: nur bei HA an
       } else {
         pendingCleanupQueue(sname.c_str());   // §18: bei Disconnect vormerken
       }
@@ -1446,8 +1446,11 @@ static void apiCalib(NetworkClient &c, const String &body) {
 
 static void apiMqttSave(NetworkClient &c, const String &body) {
   String s;
+  bool wasHa = mqttConfig.haDisc;
   mqttConfig.enabled = body.indexOf(F("enabled=1")) >= 0;
   mqttConfig.haDisc  = body.indexOf(F("hadisc=1")) >= 0;
+  if (wasHa && !mqttConfig.haDisc)   // §5.5: HA gerade ausgeschaltet -> Entitaeten einmalig entfernen (sonst Geister)
+    for (uint8_t i = 0; i < MAX_FANS; i++) haDiscoveryFan(i, false);
   if (formGet(body, F("host"),   s)) safeStrcpy(mqttConfig.host,   sizeof(mqttConfig.host),   s);
   if (formGet(body, F("port"),   s)) mqttConfig.port = (uint16_t)constrain(s.toInt(), 1, 65535);
   if (formGet(body, F("user"),   s)) safeStrcpy(mqttConfig.user,   sizeof(mqttConfig.user),   s);
