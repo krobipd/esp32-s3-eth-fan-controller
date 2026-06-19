@@ -1,0 +1,35 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: arduino/setup-arduino-cli@v2
+
+      - name: Cache ESP32 core & libraries
+        uses: actions/cache@v4
+        with:
+          path: ~/.arduino15
+          key: arduino15-esp32-3.3.8-mqttclient-1.1.3
+
+      - name: Install ESP32 core 3.3.8
+        run: |
+          arduino-cli core update-index --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
+          arduino-cli core install esp32:esp32@3.3.8 --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
+
+      - name: Install libraries
+        run: arduino-cli lib install ESP32MQTTClient@1.1.3
+
+      - name: Generate UI asset (ui/index.html -> ui_asset.h)
+        run: sh tools/build_ui.sh
+
+      - name: Compile firmware
+        run: arduino-cli compile --fqbn esp32:esp32:esp32s3:CDCOnBoot=cdc fan_controller
