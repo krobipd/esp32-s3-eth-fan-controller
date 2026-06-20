@@ -72,7 +72,7 @@ Home-Automation (z. B. ioBroker) per MQTT übernehmen.
 <prefix>/<deviceId>/<fan>/set      Befehl 0–100
 <prefix>/<deviceId>/<fan>/rpm      Drehzahl
 ```
-Beispiel: `esp/ws-s3eth-1A2B3C/nas/set` = `60`. Details: [MQTT.md](docs/MQTT.md).
+Beispiel: `esp/ws-s3eth-1A2B3C/fan-a/set` = `60`. Details: [MQTT.md](docs/MQTT.md).
 
 ## 🗂️ Repo-Struktur
 

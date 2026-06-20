@@ -26,9 +26,9 @@ Beispiel (prefix `esp`, Lüfter `nas`):
 | `esp/ws-s3eth-1A2B3C/info/status` | Gerät → Broker | `online` (retained), `offline` (Last-Will) |
 | `esp/ws-s3eth-1A2B3C/info/version` | Gerät → Broker | z. B. `5.2.0` (retained) |
 | `esp/ws-s3eth-1A2B3C/info/ip` | Gerät → Broker | z. B. `10.0.0.42` (retained) |
-| `esp/ws-s3eth-1A2B3C/nas/speed` | Gerät → Broker | z. B. `58` (Ist-%, retained) |
-| `esp/ws-s3eth-1A2B3C/nas/rpm` | Gerät → Broker | z. B. `864` |
-| `esp/ws-s3eth-1A2B3C/nas/set` | Broker → Gerät | `0`–`100` (Sollwert in %) |
+| `esp/ws-s3eth-1A2B3C/fan-a/speed` | Gerät → Broker | z. B. `58` (Ist-%, retained) |
+| `esp/ws-s3eth-1A2B3C/fan-a/rpm` | Gerät → Broker | z. B. `864` |
+| `esp/ws-s3eth-1A2B3C/fan-a/set` | Broker → Gerät | `0`–`100` (Sollwert in %) |
 
 Wichtig:
 - **Steuern** ausschließlich über `…/<fan>/set` (0–100). `…/speed` ist der **Ist-Wert** und
@@ -42,16 +42,16 @@ Wichtig:
 
 Der MQTT-Adapter (Broker- oder Client-Modus) legt eingehende Topics **automatisch** als
 Objekte an — für `info/*` und `speed`/`rpm` ist also nichts zu konfigurieren. Aus
-`esp/ws-s3eth-1A2B3C/nas/speed` wird das Objekt:
+`esp/ws-s3eth-1A2B3C/fan-a/speed` wird das Objekt:
 
 ```
-mqtt.0.esp.ws-s3eth-1A2B3C.nas.speed
+mqtt.0.esp.ws-s3eth-1A2B3C.fan-a.speed
 ```
 
 Zum **Steuern** schreibst du den Sollwert (0–100) auf den `set`-Datenpunkt mit `ack:false`:
 
 ```
-mqtt.0.esp.ws-s3eth-1A2B3C.nas.set  =  60   (ack:false)
+mqtt.0.esp.ws-s3eth-1A2B3C.fan-a.set  =  60   (ack:false)
 ```
 
 Damit der Adapter diesen Wert auch wirklich an den Broker published, muss er für eigene

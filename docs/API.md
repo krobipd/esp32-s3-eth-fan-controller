@@ -40,12 +40,12 @@ und werden im Hauptloop abgearbeitet (entkoppelt von der Hardware).
   "net_loops": 1234890,
   "net_stack_hwm": 4304,
   "mqtt": { "enabled": true, "host": "10.0.0.5", "port": 1883, "user": "iob", "prefix": "esp" },
-  "free_pwm":  [1,2,8,15,16,17,18,21,33,34,39,48],
-  "free_tach": [1,2,8,15,16,17,18,21,33,34,39,48],
+  "free_pwm":  [1,2,8,15,16,17,33,34,39,48],
+  "free_tach": [1,2,8,15,16,17,33,34,39,48],
   "fans": [
-    { "index":0, "name":"nas", "present":true, "pwm":148, "pct":58, "rpm":864,
-      "pwmPin":47, "tachPin":38, "fault":0, "validated":true, "inv":false,
-      "cmin":15, "cnote":"be quiet" }
+    { "index":0, "name":"fan-a", "present":true, "pwm":148, "pct":58, "rpm":864,
+      "pwmPin":18, "tachPin":21, "fault":0, "validated":true, "inv":false,
+      "cmin":15, "cnote":"120mm" }
   ]
 }
 ```
