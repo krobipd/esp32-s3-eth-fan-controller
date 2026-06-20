@@ -40,10 +40,15 @@ static void onEthEvent(arduino_event_id_t event, arduino_event_info_t info) {
   }
 }
 
+// §F7: Event-Callback EINMALIG registrieren (in setup(), NICHT in ethBegin) — sonst haengt
+// jeder ethHardReset() einen weiteren Handler an Network.onEvent an -> Liste waechst.
+static void ethRegisterEvents() {
+  Network.onEvent(onEthEvent);
+}
+
 // Startet SPI + nativen W5500-Treiber. Rückgabe true bei erfolgreichem ETH.begin.
 // Overload ETH.h Z.169: (type, phy_addr, cs, irq, rst, SPIClass&, freq_mhz)
 static bool ethBegin() {
-  Network.onEvent(onEthEvent);
   ETH.setHostname(ETH_HOSTNAME);   // VOR begin: meldet den Namen auch beim DHCP an
   SPI.begin(ETH_SPI_SCK, ETH_SPI_MISO, ETH_SPI_MOSI, ETH_PIN_CS);
   return ETH.begin(ETH_PHY_W5500, 1, ETH_PIN_CS, ETH_PIN_INT, ETH_PIN_RST, SPI, ETH_SPI_MHZ);

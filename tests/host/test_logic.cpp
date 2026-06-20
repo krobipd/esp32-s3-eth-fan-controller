@@ -12,6 +12,10 @@ int main() {
   assert( elapsed(0x00000150u, since, 0x200));  // 0x250 ms vergangen
   // pct<->duty Roundtrip muss fuer alle 0..100 stabil sein
   for (int p = 0; p <= 100; p++) assert(pctFromDuty(dutyFromPct((uint8_t)p)) == p);
+  // §F10: dutyFromPct klemmt pct>100 auf 100 (=255); pctFromDuty deckt die volle 0..255-Domaene monoton ab
+  assert(dutyFromPct(100) == 255 && dutyFromPct(101) == 255 && dutyFromPct(255) == 255);
+  assert(pctFromDuty(0) == 0 && pctFromDuty(255) == 100);
+  for (int d = 1; d <= 255; d++) assert(pctFromDuty((uint8_t)d) >= pctFromDuty((uint8_t)(d - 1)));
   // Namen: nur a-z 0-9 _ - , 1..19 Zeichen, reservierte verboten
   assert(fanNameValid("fan-a"));  assert(fanNameValid("fan_2-x"));
   assert(!fanNameValid(""));    assert(!fanNameValid("FAN-A"));
@@ -24,6 +28,12 @@ int main() {
   assert(!mqttPrefixValid("abcdefghij123456"));   // 16 -> zu lang
   assert(!mqttPrefixValid("a/b")); assert(!mqttPrefixValid("a#b")); assert(!mqttPrefixValid("a+b"));  // Hierarchie/Wildcard
   assert(!mqttPrefixValid("a\"b")); assert(!mqttPrefixValid("a b"));  // JSON-Break / Space
+  // §F5: Passwort-Aenderungs-Erkennung (leeres Feld = altes behalten)
+  assert(!mqttPassChanged(false, "secret", ""));       // nichts geschickt -> keine Aenderung
+  assert(!mqttPassChanged(false, "secret", "secret"));
+  assert(!mqttPassChanged(true,  "secret", "secret")); // identisch -> keine Aenderung
+  assert( mqttPassChanged(true,  "secret", "neu"));     // neues PW -> Aenderung
+  assert( mqttPassChanged(true,  "", "neu"));           // vorher leer, jetzt gesetzt -> Aenderung
 
   // §18: RAM-only Pending-Cleanup-Liste — verwaiste retained Topics bei MQTT-disconnect merken
   PendingCleanup pc = {};
@@ -43,6 +53,9 @@ int main() {
   assert(pc.count == CLEANUP_MAX);
   pendingCleanupClear(pc);
   assert(pc.count == 0);
+  // §F10: Namen laenger als 19 Zeichen werden gekappt (Buffer names[20])
+  assert(pendingCleanupAdd(pc, "0123456789abcdefghijXYZ"));   // 23 Zeichen rein
+  assert(strlen(pc.names[0]) == 19 && strcmp(pc.names[0], "0123456789abcdefghi") == 0);
 
   // §5.5 HA-Discovery Config-JSON  (Platzhalter-deviceId/-Luefter, keine echten Daten)
   std::string num = haNumberConfig("esp", "ws-s3eth-1A2B3C", "fan-a", "5.3.0");

@@ -47,6 +47,12 @@ static inline bool mqttPrefixValid(const char *s) {
   return true;
 }
 
+// §F5: Passwort gilt nur als geaendert, wenn das Formular ein NICHT-leeres Passwort geschickt hat
+// (das UI schickt leer = "altes behalten") UND es vom alten abweicht. Sonst false -> kein Reboot.
+static inline bool mqttPassChanged(bool provided, const char *oldPass, const char *newPass) {
+  return provided && strcmp(oldPass, newPass) != 0;
+}
+
 // §18: RAM-only Pending-Cleanup-Liste fuer verwaiste retained MQTT-Topics.
 // Wird ein Luefter geloescht/umbenannt waehrend MQTT getrennt ist, laesst sich der alte
 // retained Topic (…/<name>/speed) nicht sofort raeumen -> sanitized Namen hier vormerken;

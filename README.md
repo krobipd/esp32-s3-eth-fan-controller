@@ -10,6 +10,8 @@
 ![Platform](https://img.shields.io/badge/Platform-ESP32--S3-E7352C?logo=espressif&logoColor=white)
 ![Arduino](https://img.shields.io/badge/Arduino-Core_3.3.8-00979D?logo=arduino&logoColor=white)
 ![MQTT](https://img.shields.io/badge/MQTT-ready-660099?logo=mqtt&logoColor=white)
+![Home Assistant](https://img.shields.io/badge/Home%20Assistant-Auto--Discovery-41BDF5?logo=homeassistant&logoColor=white)
+![ioBroker](https://img.shields.io/badge/ioBroker-MQTT-3399CC?logo=iobroker&logoColor=white)
 ![Ethernet](https://img.shields.io/badge/Ethernet-W5500%20%2F%20PoE-555555)
 
 </div>
@@ -37,6 +39,17 @@ Home-Automation (z. B. ioBroker) per MQTT übernehmen.
 - **Bombensicheres OTA** — Update in die inaktive Partition + automatisches
   Bootloader-Rollback, falls ein frisches Image das Health-Window nicht übersteht.
   (Auf der Zielhardware end-to-end verifiziert.)
+
+## 🔌 Integrationen
+
+Das Gerät spricht **Standard-MQTT** und lässt sich damit an jede MQTT-fähige Home-Automation anbinden:
+
+- **Home Assistant** — eingebaute **MQTT-Discovery** (in den MQTT-Einstellungen zuschaltbar): jeder Lüfter
+  erscheint automatisch als `number` (Soll-%) + `sensor` (RPM), inkl. Online/Offline-Status. Kein manuelles YAML.
+- **ioBroker** — über den MQTT-Adapter: die flachen Topics (`…/<lüfter>/speed`, `/set`, `/rpm`) landen direkt
+  als Datenpunkte.
+- **Beliebiger MQTT-Broker / Node-RED / eigene Logik** — flaches, dokumentiertes Topic-Schema, siehe
+  [docs/MQTT.md](docs/MQTT.md).
 
 ## 📖 Dokumentation
 
