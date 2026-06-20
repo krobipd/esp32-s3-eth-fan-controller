@@ -53,7 +53,7 @@ static const uint32_t OTA_HEALTH_MS = 90000;
 // ==== Limits & Timing ====
 // ==== Version (Semver, EINZIGE Quelle der Wahrheit) ====
 // Bumpen + git-Tag vX.Y.Z müssen zusammenpassen. MAJOR=Architektur/Breaking, MINOR=Feature, PATCH=Fix.
-#define FW_VERSION "5.4.1"
+#define FW_VERSION "5.4.2"
 
 static const uint8_t  MAX_FANS              = 8;
 // §4.7: Arduino-loopTask laeuft auf Core 1 = Control-Core. ISR-/PCNT-/LEDC-Registrierung MUSS
@@ -1506,16 +1506,29 @@ static void apiMqttSave(NetworkClient &c, const String &body) {
   // (Wildcards) oder das HA-Discovery-JSON brechen.
   String newPrefix; bool hasPrefix = formGet(body, F("prefix"), s);
   if (hasPrefix) { newPrefix = s; if (!mqttPrefixValid(newPrefix.c_str())) { apiErr(c, "prefix: nur A-Za-z0-9_- , 1..15 Zeichen"); return; } }
-  bool wasHa = mqttConfig.haDisc;
+  // §F5: alten Stand sichern, neue Werte uebernehmen, dann pruefen ob sich WIRKLICH etwas geaendert
+  // hat -> nur dann schreiben + Reboot (kein unnoetiger Neustart bei unveraendertem Speichern).
+  MQTTConfig old = mqttConfig;
+  bool passProvided = false;
   mqttConfig.enabled = body.indexOf(F("enabled=1")) >= 0;
   mqttConfig.haDisc  = body.indexOf(F("hadisc=1")) >= 0;
-  if (wasHa && !mqttConfig.haDisc)   // §5.5: HA gerade ausgeschaltet -> Entitaeten einmalig entfernen (sonst Geister)
-    for (uint8_t i = 0; i < MAX_FANS; i++) haDiscoveryFan(i, false);
   if (formGet(body, F("host"),   s)) safeStrcpy(mqttConfig.host,   sizeof(mqttConfig.host),   s);
   if (formGet(body, F("port"),   s)) mqttConfig.port = (uint16_t)constrain(s.toInt(), 1, 65535);
   if (formGet(body, F("user"),   s)) safeStrcpy(mqttConfig.user,   sizeof(mqttConfig.user),   s);
-  if (formGet(body, F("pass"),   s) && s.length() > 0) safeStrcpy(mqttConfig.pass, sizeof(mqttConfig.pass), s);
+  if (formGet(body, F("pass"),   s) && s.length() > 0) { safeStrcpy(mqttConfig.pass, sizeof(mqttConfig.pass), s); passProvided = true; }
   if (hasPrefix) safeStrcpy(mqttConfig.prefix, sizeof(mqttConfig.prefix), newPrefix);
+
+  bool changed = old.enabled != mqttConfig.enabled
+              || old.haDisc  != mqttConfig.haDisc
+              || old.port    != mqttConfig.port
+              || strcmp(old.host,   mqttConfig.host)   != 0
+              || strcmp(old.user,   mqttConfig.user)   != 0
+              || strcmp(old.prefix, mqttConfig.prefix) != 0
+              || mqttPassChanged(passProvided, old.pass, mqttConfig.pass);
+  if (!changed) { LOGI("MQTT", "config unveraendert -> kein Reboot"); apiOk(c); return; }   // §F5
+
+  if (old.haDisc && !mqttConfig.haDisc)   // §5.5: HA gerade ausgeschaltet -> Entitaeten einmalig entfernen (sonst Geister)
+    for (uint8_t i = 0; i < MAX_FANS; i++) haDiscoveryFan(i, false);
   Preferences p; p.begin("mqtt", false);
   p.putBool("enabled", mqttConfig.enabled);
   p.putString("host",   mqttConfig.host);
@@ -1765,6 +1778,7 @@ void setup() {
   // [Stufe2/1] Nativer W5500-Treiber (ETH.h). DHCP laeuft async; das GOT_IP-Event
   // setzt g_ethHasIp; httpServer wird in loop() gestartet, sobald die IP da ist.
   feedWdt();
+  ethRegisterEvents();   // §F7: Event-Callback EINMALIG, vor dem ersten ethBegin (ethHardReset re-registriert nicht mehr)
   if (!ethBegin()) LOGE("NET", "ETH.begin failed");
   feedWdt();
 
@@ -1885,7 +1899,7 @@ void loop() {
         f.rpmRawC = 0;
         fanMarkFault(i, FF_OK);
       } else {
-        if (f.duty >= max<uint8_t>(1, f.calMinStart) && pulsesDelta == 0)
+        if (f.duty >= max<uint8_t>(1, f.calMinStart) && pulsesDelta == 0 && f.burstLeft == 0)  // §F9: kein Fault waehrend Anlauf-Fenster (burstLeft>0)
           fanMarkFault(i, FF_NO_TACH_PULSES);
         else
           fanMarkFault(i, FF_OK);

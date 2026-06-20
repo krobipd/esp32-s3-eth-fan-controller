@@ -142,7 +142,7 @@ function badge(f){if(!f.validated)return'<span class="badge b-err">CONFIG</span>
  return'<span class="badge b-err">FAULT '+f.fault+"</span>";}
 function renderDash(){const g=$("fangrid");const fans=(J.fans||[]).filter(f=>f.present!==false);
  $("nofans").style.display=fans.length?"none":"";
- const key=fans.map(f=>f.index+":"+f.name+":"+f.fault+":"+f.validated).join("|");
+ const key=fans.map(f=>f.index+":"+f.name+":"+f.fault+":"+f.validated+":"+f.pwmPin+":"+f.tachPin).join("|");
  if(g.dataset.key!==key){g.dataset.key=key;g.innerHTML="";
   fans.forEach(f=>{const d=document.createElement("div");
    d.className="fan f"+f.fault+(f.validated?"":" bad");
