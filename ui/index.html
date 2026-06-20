@@ -95,6 +95,7 @@ border-radius:6px;padding:10px 14px;display:none;font-size:12px}
         <label>TACHO-PIN</label><select id="e-tach"></select>
         <label><input type="checkbox" id="e-inv" style="width:auto"> PWM invertieren</label>
         <button class="btn" onclick="saveFan()">Speichern</button>
+        <button class="btn" onclick="closeFan()">Schließen</button>
         <div id="editonly">
         <button class="btn danger" onclick="delFan()">Löschen</button>
         <label>KALIBRIERUNG: MIN-START (%)</label><input type="number" id="e-cmin" min="0" max="100" value="0">
@@ -107,7 +108,7 @@ border-radius:6px;padding:10px 14px;display:none;font-size:12px}
       <label>USER</label><input type="text" id="m-user">
       <label>PASSWORT</label><input type="password" id="m-pass" placeholder="(unverändert lassen = leer)">
       <label>PREFIX</label><input type="text" id="m-prefix" maxlength="15">
-      <label style="margin-top:12px"><input type="checkbox" id="m-ha" style="width:auto"> Home-Assistant-Discovery (für andere; default aus)</label>
+      <label style="margin-top:12px"><input type="checkbox" id="m-ha" style="width:auto"> Home-Assistant Auto-Discovery (default aus)</label>
       <button class="btn" onclick="saveMqtt()">MQTT speichern</button>
       <p class="muted small">Topics: prefix/&lt;device&gt;/&lt;name&gt;/speed·set·rpm + …/info/status·version·ip</p></div>
   </div></section>
@@ -128,7 +129,7 @@ const $=id=>document.getElementById(id);
 const esc=s=>String(s??"").replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[m]));
 let J=null,editIdx=-1,fail=0,mqttLoaded=false;
 function tab(t){document.querySelectorAll("nav button").forEach(b=>b.classList.toggle("act",b.dataset.t===t));
- ["dash","sys","cfg","fw"].forEach(x=>$("t-"+x).style.display=x===t?"":"none");}
+ ["dash","sys","cfg","fw"].forEach(x=>$("t-"+x).style.display=x===t?"":"none");$("editbox").style.display="none";}
 function toast(m){const t=$("toast");t.textContent=m;t.style.display="block";setTimeout(()=>t.style.display="none",2500);}
 function api(url,data,okCb){const body=Object.entries(data).map(([k,v])=>k+"="+encodeURIComponent(v)).join("&");
  fetch(url,{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded"},body})
@@ -184,6 +185,7 @@ function newFan(){editIdx=-1;$("editbox").style.display="";$("editonly").style.d
  $("e-name").value="";pinOpts($("e-pwm"),J.free_pwm||[],undefined);pinOpts($("e-tach"),J.free_tach||[],undefined);
  const pw=$("e-pwm").value,ts=$("e-tach");for(let k=0;k<ts.options.length;k++){if(ts.options[k].value!==pw){ts.selectedIndex=k;break;}} // Default: Tacho!=PWM
  $("e-inv").checked=false;}
+function closeFan(){$("editbox").style.display="none";}
 function saveFan(){const nm=$("e-name").value.trim();if(!nm){toast("Name fehlt");return;}
  if($("e-pwm").value===$("e-tach").value){toast("PWM- und Tacho-Pin müssen verschieden sein");return;}
  api("/api/fan/save",{idx:editIdx,name:nm,pwm:$("e-pwm").value,
