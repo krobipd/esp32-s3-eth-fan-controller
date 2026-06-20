@@ -12,8 +12,8 @@
 html{color-scheme:dark light}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--fg);
-font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:14px}
-.wrap{max-width:1000px;margin:0 auto;padding:14px}
+font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:15px}
+.wrap{max-width:1320px;margin:0 auto;padding:16px}
 header{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;
 border-bottom:1px solid var(--bd);padding-bottom:10px;margin-bottom:2px}
 h1{font-size:15px;margin:0;letter-spacing:.1em}h1 small{color:var(--dim);font-weight:400}
@@ -26,13 +26,13 @@ nav button{font:inherit;font-size:12px;letter-spacing:.08em;padding:7px 14px;cur
 background:none;border:1px solid var(--bd);border-bottom:none;border-radius:6px 6px 0 0;color:var(--dim)}
 nav button.act{background:var(--panel);color:var(--fg)}
 main{background:var(--panel);border:1px solid var(--bd);border-radius:0 6px 6px 6px;padding:14px;min-height:300px}
-.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:10px}
-.fan{background:var(--bg);border:1px solid var(--bd);border-left:3px solid var(--ok);border-radius:6px;padding:10px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:12px}
+.fan{background:var(--bg);border:1px solid var(--bd);border-left:3px solid var(--ok);border-radius:6px;padding:14px}
 .fan.f3{border-left-color:var(--warn)}.fan.f4,.fan.bad{border-left-color:var(--err)}
-.fan .top{display:flex;justify-content:space-between;font-size:11px;color:var(--mut)}
-.fan .rpm{font-size:26px;font-weight:700;margin:4px 0}.fan .rpm small{font-size:11px;color:var(--dim)}
+.fan .top{display:flex;justify-content:space-between;font-size:13px;color:var(--mut)}
+.fan .rpm{font-size:40px;font-weight:700;margin:6px 0}.fan .rpm small{font-size:13px;color:var(--dim)}
 .fan input[type=range]{width:100%;accent-color:var(--acc)}
-.fan .pct{font-size:11px;color:var(--mut)}
+.fan .pct{font-size:12px;color:var(--mut)}
 .badge{font-size:10px;padding:1px 7px;border-radius:8px;border:1px solid var(--bd)}
 .b-ok{color:var(--bok)}.b-warn{color:var(--bwarn)}.b-err{color:var(--berr)}
 .kv{display:grid;grid-template-columns:max-content 1fr;gap:6px 18px;font-size:13px}
