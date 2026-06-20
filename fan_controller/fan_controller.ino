@@ -53,7 +53,7 @@ static const uint32_t OTA_HEALTH_MS = 90000;
 // ==== Limits & Timing ====
 // ==== Version (Semver, EINZIGE Quelle der Wahrheit) ====
 // Bumpen + git-Tag vX.Y.Z müssen zusammenpassen. MAJOR=Architektur/Breaking, MINOR=Feature, PATCH=Fix.
-#define FW_VERSION "5.4.0"
+#define FW_VERSION "5.4.1"
 
 static const uint8_t  MAX_FANS              = 8;
 // §4.7: Arduino-loopTask laeuft auf Core 1 = Control-Core. ISR-/PCNT-/LEDC-Registrierung MUSS
@@ -547,7 +547,7 @@ static void loadMQTTConfig() {
     mqttConfig.haDisc = p.getBool("hadisc", false);
   }
   p.end();
-  LOGI("PREFS", String("MQTT: ") + (mqttConfig.enabled ? "on" : "off") + " host=" + mqttConfig.host + " port=" + mqttConfig.port);
+  LOGI("PREFS", String("MQTT: ") + (mqttConfig.enabled ? "on" : "off") + " port=" + mqttConfig.port);  // §F11a: Broker-IP nicht ins persistente Log
 }
 
 // ==== JSON Helpers ====
@@ -1501,6 +1501,11 @@ static void apiCalib(NetworkClient &c, const String &body) {
 
 static void apiMqttSave(NetworkClient &c, const String &body) {
   String s;
+  // §SEC-2/B2 (F4): Prefix ZUERST validieren -> ungueltig (leer / # + / " \ / >15) ablehnen, VOR
+  // jeder Konfig-Mutation und VOR dem Reboot. Sonst koennte ein praeparierter Prefix MQTT-Topics
+  // (Wildcards) oder das HA-Discovery-JSON brechen.
+  String newPrefix; bool hasPrefix = formGet(body, F("prefix"), s);
+  if (hasPrefix) { newPrefix = s; if (!mqttPrefixValid(newPrefix.c_str())) { apiErr(c, "prefix: nur A-Za-z0-9_- , 1..15 Zeichen"); return; } }
   bool wasHa = mqttConfig.haDisc;
   mqttConfig.enabled = body.indexOf(F("enabled=1")) >= 0;
   mqttConfig.haDisc  = body.indexOf(F("hadisc=1")) >= 0;
@@ -1510,7 +1515,7 @@ static void apiMqttSave(NetworkClient &c, const String &body) {
   if (formGet(body, F("port"),   s)) mqttConfig.port = (uint16_t)constrain(s.toInt(), 1, 65535);
   if (formGet(body, F("user"),   s)) safeStrcpy(mqttConfig.user,   sizeof(mqttConfig.user),   s);
   if (formGet(body, F("pass"),   s) && s.length() > 0) safeStrcpy(mqttConfig.pass, sizeof(mqttConfig.pass), s);
-  if (formGet(body, F("prefix"), s)) safeStrcpy(mqttConfig.prefix, sizeof(mqttConfig.prefix), s);
+  if (hasPrefix) safeStrcpy(mqttConfig.prefix, sizeof(mqttConfig.prefix), newPrefix);
   Preferences p; p.begin("mqtt", false);
   p.putBool("enabled", mqttConfig.enabled);
   p.putString("host",   mqttConfig.host);
@@ -1775,7 +1780,7 @@ void setup() {
     mqtt.enableLastWillMessage(g_mqttLwtTopic.c_str(), "offline", true);
     mqtt.setKeepAlive(30);
     mqtt.loopStart();
-    LOGI("MQTT", String("esp-mqtt -> ") + mqttConfig.host + ":" + mqttConfig.port);
+    LOGI("MQTT", String("esp-mqtt started (port ") + mqttConfig.port + ")");  // §F11a: Broker-IP nicht ins Log
   }
 
   LOGI("BOOT", "Setup complete.");

@@ -17,6 +17,13 @@ int main() {
   assert(!fanNameValid(""));    assert(!fanNameValid("FAN-A"));
   assert(!fanNameValid("status")); assert(!fanNameValid("sys")); assert(!fanNameValid("info"));
   assert(!fanNameValid("zu-lang-1234567890123"));
+  // §SEC-2/B2 (F4): MQTT-Prefix — topic-/JSON-sicher, 1..15 Zeichen, A-Z erlaubt
+  assert(mqttPrefixValid("esp"));  assert(mqttPrefixValid("Home_1-x"));
+  assert(mqttPrefixValid("abcdefghij12345"));     // genau 15 -> ok
+  assert(!mqttPrefixValid(""));                   // leer
+  assert(!mqttPrefixValid("abcdefghij123456"));   // 16 -> zu lang
+  assert(!mqttPrefixValid("a/b")); assert(!mqttPrefixValid("a#b")); assert(!mqttPrefixValid("a+b"));  // Hierarchie/Wildcard
+  assert(!mqttPrefixValid("a\"b")); assert(!mqttPrefixValid("a b"));  // JSON-Break / Space
 
   // §18: RAM-only Pending-Cleanup-Liste — verwaiste retained Topics bei MQTT-disconnect merken
   PendingCleanup pc = {};
