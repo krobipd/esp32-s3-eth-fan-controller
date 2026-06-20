@@ -30,6 +30,23 @@ static inline bool fanNameValid(const char *s) {
   return true;
 }
 
+// §SEC-2/B2 (F4): MQTT-Prefix muss topic-/JSON-sicher sein -> nur [A-Za-z0-9_-], 1..15 Zeichen
+// (passt in char prefix[16]). Anders als fanNameValid sind Grossbuchstaben erlaubt (der Prefix ist
+// kein Anzeigename). Damit ist er automatisch wildcard-/hierarchie-frei (kein # + /) UND JSON-sicher
+// (kein " \) -> der HA-Discovery-JSON-Builder braucht keinen eigenen Escaper.
+static inline bool mqttPrefixValid(const char *s) {
+  if (!s) return false;
+  size_t n = strlen(s);
+  if (n < 1 || n > 15) return false;
+  for (size_t i = 0; i < n; i++) {
+    char c = s[i];
+    if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+          (c >= '0' && c <= '9') || c == '_' || c == '-'))
+      return false;
+  }
+  return true;
+}
+
 // §18: RAM-only Pending-Cleanup-Liste fuer verwaiste retained MQTT-Topics.
 // Wird ein Luefter geloescht/umbenannt waehrend MQTT getrennt ist, laesst sich der alte
 // retained Topic (…/<name>/speed) nicht sofort raeumen -> sanitized Namen hier vormerken;
