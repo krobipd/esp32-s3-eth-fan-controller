@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""UI-Entwicklung ohne Geraet: python3 tools/mock_api.py -> http://127.0.0.1:8077"""
+"""UI-Entwicklung ohne Geraet: python3 tools/mock_api.py -> http://127.0.0.1:8077
+Reine Platzhalter-Daten (kein echtes Setup)."""
 import json, random, http.server
 
 FANS = [
-  {"index":0,"name":"mac","present":True,"pwm":133,"pct":52,"rpm":724,"pwmPin":40,"tachPin":37,"fault":0,"validated":True,"inv":False,"cmin":20,"cnote":"Noctua"},
-  {"index":1,"name":"unifi","present":True,"pwm":140,"pct":55,"rpm":811,"pwmPin":42,"tachPin":35,"fault":0,"validated":True,"inv":False,"cmin":0,"cnote":""},
-  {"index":2,"name":"usv","present":True,"pwm":128,"pct":50,"rpm":747,"pwmPin":41,"tachPin":36,"fault":3,"validated":True,"inv":True,"cmin":0,"cnote":""},
-  {"index":3,"name":"nas","present":True,"pwm":148,"pct":58,"rpm":858,"pwmPin":47,"tachPin":38,"fault":0,"validated":True,"inv":False,"cmin":15,"cnote":"be quiet"},
+  {"index":0,"name":"fan-a","present":True,"pwm":133,"pct":52,"rpm":724,"pwmPin":1,"tachPin":2,"fault":0,"validated":True,"inv":False,"cmin":20,"cnote":"120mm"},
+  {"index":1,"name":"fan-b","present":True,"pwm":140,"pct":55,"rpm":811,"pwmPin":8,"tachPin":15,"fault":0,"validated":True,"inv":False,"cmin":0,"cnote":""},
+  {"index":2,"name":"fan-c","present":True,"pwm":128,"pct":50,"rpm":747,"pwmPin":16,"tachPin":17,"fault":3,"validated":True,"inv":True,"cmin":0,"cnote":""},
+  {"index":3,"name":"fan-d","present":True,"pwm":148,"pct":58,"rpm":858,"pwmPin":18,"tachPin":21,"fault":0,"validated":True,"inv":False,"cmin":15,"cnote":""},
 ]
 
 class H(http.server.BaseHTTPRequestHandler):
@@ -20,13 +21,13 @@ class H(http.server.BaseHTTPRequestHandler):
             for f in FANS:
                 f["rpm"] = max(0, f["rpm"] + random.randint(-15, 15))
             self._send(200, "application/json", json.dumps({
-                "rev":1,"device":"ws-s3eth-MOCK","ip":"10.47.88.239","mqtt_connected":True,
+                "rev":1,"device":"ws-s3eth-MOCK","ip":"192.168.1.50","mqtt_connected":True,
                 "boot_count":42,"safe_mode":False,"reset_reason":"POWERON",
                 "min_free_heap":201000,"largest_block":198000,"uptime_s":361445,
                 "wdt":True,"ota_pending":False,"crash_streak":0,
-                "mqtt":{"enabled":True,"host":"10.47.88.5","port":1883,"user":"iob","prefix":"esp"},
-                "free_pwm":[1,2,8,15,16,17,18,21,33,34,39,48],
-                "free_tach":[1,2,8,15,16,17,18,21,33,34,39,48],
+                "mqtt":{"enabled":True,"host":"192.168.1.10","port":1883,"user":"user","prefix":"esp"},
+                "free_pwm":[4,5,6,7,33,34,39,48],
+                "free_tach":[4,5,6,7,33,34,39,48],
                 "fans":FANS}))
         elif self.path == "/log.txt":
             self._send(200, "text/plain", "[T+0001.000s #42] [I] BOOT: mock log\n" * 30)
