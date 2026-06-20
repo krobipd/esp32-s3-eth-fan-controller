@@ -53,7 +53,7 @@ static const uint32_t OTA_HEALTH_MS = 90000;
 // ==== Limits & Timing ====
 // ==== Version (Semver, EINZIGE Quelle der Wahrheit) ====
 // Bumpen + git-Tag vX.Y.Z müssen zusammenpassen. MAJOR=Architektur/Breaking, MINOR=Feature, PATCH=Fix.
-#define FW_VERSION "5.3.1"
+#define FW_VERSION "5.4.0"
 
 static const uint8_t  MAX_FANS              = 8;
 // §4.7: Arduino-loopTask laeuft auf Core 1 = Control-Core. ISR-/PCNT-/LEDC-Registrierung MUSS
@@ -79,6 +79,7 @@ static const uint16_t MQTT_RPM_ABS_DELTA    = 50;
 static const unsigned long CLIENT_RD_TIMEOUT = 3000;   // Stall-Budget pro Zeile (< WDT 8s)
 static const unsigned long BODY_RD_TIMEOUT   = 30000;  // Stall-Budget Body/OTA (t0 reset bei Fortschritt)
 static const unsigned long HTTP_REQ_BUDGET_MS = 10000; // Gesamtbudget Nicht-OTA-Request (Spec §3.1)
+static const unsigned long OTA_TIMEOUT_TOTAL_MS = 300000; // §SEC-3: absolutes OTA-Transfer-Budget (5 min) gegen Trickle-DoS
 static const size_t        LOG_MAX           = 8192;
 static const uint32_t      LOG_FLUSH_MS      = 600000;  // 10 min — NVS-Wear (Spec §3.5)
 static const size_t        LOG_NVS_MAX       = 1600;
@@ -843,9 +844,26 @@ static std::atomic<uint32_t> g_loopCtr{0};        // Control-Loop-Heartbeat (Liv
 static TaskHandle_t          g_netTaskHandle = nullptr;
 static inline void feedWdt() { esp_task_wdt_reset(); }   // §5.3: fuettert den AKTUELLEN Task (beide abonniert)
 
-// Jeden vorhandenen Lüfter auf .../set abonnieren (idx-gebundenes Lambda).
-static void mqttSubscribeFan(uint8_t i) {
-  mqtt.subscribe((topicFan(i) + "/set").c_str(), [i](const std::string &p) { mqttApplySet(i, p); });
+// §A1: EIN Wildcard-Subscribe (<prefix>/<deviceId>/+/set) statt pro-Luefter -> der Lib-Vektor
+// _topicSubscriptionList wird NUR in onMqttConnect (esp-mqtt-Task) mutiert, nie bei Rename/Delete
+// -> kein Race mit der Iteration im selben Task. Callback bekommt das Topic, findet idx ueber den
+// Namen (eindeutig, unter Lock). '+' matcht nur die Fan-Ebene; .../info/status matcht nicht (endet != set).
+static void mqttOnSetTopic(const std::string &topic, const std::string &payload) {
+  String t = topic.c_str();
+  String pre = topicDev() + "/";
+  if (!t.startsWith(pre)) return;
+  String rest = t.substring(pre.length());           // erwartet "<fan>/set"
+  int slash = rest.indexOf('/');
+  if (slash < 0 || rest.substring(slash) != "/set") return;
+  String fanName = rest.substring(0, slash);
+  int idx = -1;
+  fansLock();
+  for (uint8_t i = 0; i < MAX_FANS; i++) {
+    if (fans[i].name[0] == 0) continue;
+    if (sanitizeName(String(fans[i].name)) == fanName) { idx = i; break; }
+  }
+  fansUnlock();
+  if (idx >= 0) mqttApplySet((uint8_t)idx, payload);
 }
 
 // §5.5 HA-Discovery: fester Standard-Discovery-Prefix (HA-Default). Config-Topic:
@@ -888,13 +906,14 @@ void onMqttConnect(esp_mqtt_client_handle_t client) {
   fansLock(); snap = g_pendingCleanup; pendingCleanupClear(g_pendingCleanup); fansUnlock();
   for (uint8_t k = 0; k < snap.count; k++) {
     String base = topicDev() + "/" + snap.names[k];
-    mqtt.publish((base + "/speed").c_str(), "", 0, true);
-    mqtt.unsubscribe((base + "/set").c_str());
+    mqtt.publish((base + "/speed").c_str(), "", 0, true);   // retained-clear (Wildcard-Sub bleibt bestehen)
     if (mqttConfig.haDisc) haClearName(String(snap.names[k]));   // §5.5: nur bei HA an
   }
+  // §A1: EINMAL Wildcard abonnieren (statt pro Luefter) -> _topicSubscriptionList wird nur hier
+  // (esp-mqtt-Task) mutiert; Rename/Delete fassen Subscriptions nie an (Dedup in der Lib).
+  mqtt.subscribe((topicDev() + "/+/set").c_str(), mqttOnSetTopic, 0);
   for (uint8_t i = 0; i < MAX_FANS; i++) {
     if (!fanPresentIdx(i)) continue;
-    mqttSubscribeFan(i);
     mqttPublishSpeed(i);
     if (mqttConfig.haDisc) haDiscoveryFan(i, true);   // §5.5: NUR bei HA an publishen — sonst homeassistant/ NIE anfassen
   }
@@ -905,6 +924,31 @@ void onMqttConnect(esp_mqtt_client_handle_t client) {
 void handleMQTT(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data) {
   (void)handler_args; (void)base; (void)event_id;
   mqtt.onEventCallback(static_cast<esp_mqtt_event_handle_t>(event_data));
+}
+
+// §A1: marshallte MQTT-Ops aus applyDo (Core 1) hier auf Core 0 (Netz-Task) ausfuehren — so
+// beruehren subscribe/unsubscribe/publish den esp-mqtt-Lib-Vector NUR aus dem Netz-Kontext
+// (kein Race mit dem Event-Task), und ein synchroner Publish blockiert nie den Control-Core.
+static void mqttOpDrain() {
+  if (!g_mqttOpQ) return;
+  MqttOpJob j;
+  while (xQueueReceive(g_mqttOpQ, &j, 0) == pdTRUE) {
+    if (j.kind == MQOP_CLEANUP) {
+      String san = j.name;
+      if (mqtt.isConnected()) {
+        // nur retained-clear (Publish = vektorsicher); Subscriptions liegen am Wildcard -> kein Unsubscribe.
+        mqtt.publish((topicDev() + "/" + san + "/speed").c_str(), "", 0, true);
+        if (mqttConfig.haDisc) haClearName(san);
+      } else {
+        pendingCleanupQueue(san.c_str());   // §18: bei Disconnect vormerken -> onMqttConnect raeumt nach
+      }
+    } else {   // MQOP_RESYNC: nur Publishes (Subscription liegt am Wildcard)
+      if (mqtt.isConnected()) {
+        mqttPublishSpeed(j.idx);
+        if (mqttConfig.haDisc) haDiscoveryFan(j.idx, true);
+      }
+    }
+  }
 }
 
 // ==== Apply-Worker ====
@@ -921,15 +965,10 @@ static void applyDo(ApplyJob &j) {
     detachFanCounters(idx);
 
     if (f.name[0]) {
-      String sname = sanitizeName(String(f.name));
-      if (mqtt.isConnected()) {
-        String baseOld = topicDev() + "/" + sname;
-        mqtt.publish((baseOld + "/speed").c_str(), "", 0, true);
-        mqtt.unsubscribe((baseOld + "/set").c_str());
-        if (mqttConfig.haDisc) haClearName(sname);   // §5.5: nur bei HA an
-      } else {
-        pendingCleanupQueue(sname.c_str());   // §18: bei Disconnect vormerken -> onMqttConnect raeumt nach (inkl. HA)
-      }
+      // §A1: MQTT-Cleanup an den Netz-Task (Core 0) marshallen statt hier (Core 1) direkt zu senden.
+      MqttOpJob op{}; op.kind = MQOP_CLEANUP; op.idx = idx;
+      safeStrcpy(op.name, sizeof(op.name), sanitizeName(String(f.name)));
+      if (!mqttOpPost(op)) LOGW("MQTT", "op-queue voll (cleanup) - Topic verwaist");
     }
 
     clearFanNVS(idx);
@@ -952,19 +991,15 @@ static void applyDo(ApplyJob &j) {
 
   // Name change
   if (j.nameChanged) {
-    if (f.name[0]) {  // alten Topic nur raeumen, wenn es einen gab (nicht bei Neuanlage)
-      String sname = sanitizeName(String(f.name));
-      if (mqtt.isConnected()) {
-        String oldBase = topicDev() + "/" + sname;
-        mqtt.publish((oldBase + "/speed").c_str(), "", 0, true);
-        mqtt.unsubscribe((oldBase + "/set").c_str());
-        if (mqttConfig.haDisc) haClearName(sname);   // §5.5: nur bei HA an
-      } else {
-        pendingCleanupQueue(sname.c_str());   // §18: bei Disconnect vormerken
-      }
+    if (f.name[0]) {  // §A1: alten Topic raeumen (vor dem Ueberschreiben) — als CLEANUP-Job an Core 0
+      MqttOpJob op{}; op.kind = MQOP_CLEANUP; op.idx = idx;
+      safeStrcpy(op.name, sizeof(op.name), sanitizeName(String(f.name)));
+      if (!mqttOpPost(op)) LOGW("MQTT", "op-queue voll (rename-cleanup)");
     }
     fansLock(); safeStrcpy(f.name, sizeof(f.name), String(j.name)); fansUnlock();   // §19
-    if (mqtt.isConnected()) { mqttSubscribeFan(idx); mqttPublishSpeed(idx); if (mqttConfig.haDisc) haDiscoveryFan(idx, true); }
+    // §A1: RESYNC NACH dem CLEANUP (FIFO erhaelt die Reihenfolge) -> Core 0 subscribed/publisht den NEUEN Namen
+    MqttOpJob rs{}; rs.kind = MQOP_RESYNC; rs.idx = idx;
+    if (!mqttOpPost(rs)) LOGW("MQTT", "op-queue voll (rename-resync)");
     Preferences p; p.begin("fans", false);
     p.putString((String("f") + idx + "_name").c_str(), f.name);
     p.end();
@@ -1043,6 +1078,12 @@ static void httpSend400(NetworkClient &c, const char *msg) {
   c.println(F("Connection: close"));
   c.println(); c.println(msg);
 }
+static void httpSend403(NetworkClient &c, const char *msg) {   // §SEC-1
+  c.println(F("HTTP/1.1 403 Forbidden"));
+  c.println(F("Content-Type: text/plain; charset=UTF-8"));
+  c.println(F("Connection: close"));
+  c.println(); c.println(msg);
+}
 static void httpSend500(NetworkClient &c, const char *msg) {
   c.println(F("HTTP/1.1 500 Internal Server Error"));
   c.println(F("Content-Type: text/plain; charset=UTF-8"));
@@ -1106,9 +1147,12 @@ static bool readLine(NetworkClient &c, String &out, unsigned long timeoutMs) {
   return (out.length() > 0);
 }
 
-static bool readHeaders(NetworkClient &c, size_t &contentLength, String &contentType) {
+static bool readHeaders(NetworkClient &c, size_t &contentLength, String &contentType,
+                        String &host, String &originRef) {
   contentLength = 0;
   contentType   = "";
+  host          = "";
+  originRef     = "";
   bool teChunked = false;
   String h;
   uint8_t nHdr = 0;
@@ -1122,6 +1166,15 @@ static bool readHeaders(NetworkClient &c, size_t &contentLength, String &content
     } else if (hl.startsWith(F("content-type:"))) {
       String s = h.substring(h.indexOf(':') + 1); s.trim();
       contentType = s;
+    } else if (hl.startsWith(F("host:"))) {                       // §SEC-1
+      String s = h.substring(h.indexOf(':') + 1); s.trim();
+      host = s;
+    } else if (hl.startsWith(F("origin:"))) {                     // §SEC-1 (bevorzugt)
+      String s = h.substring(h.indexOf(':') + 1); s.trim();
+      originRef = s;
+    } else if (hl.startsWith(F("referer:")) && originRef.length() == 0) {  // §SEC-1 (Fallback)
+      String s = h.substring(h.indexOf(':') + 1); s.trim();
+      originRef = s;
     } else if (hl.startsWith(F("transfer-encoding:")) && hl.indexOf(F("chunked")) >= 0) {
       teChunked = true;
     }
@@ -1316,9 +1369,11 @@ static bool handleOTA(NetworkClient &c, size_t contentLength) {
   uint8_t buf[BUFSZ];
   size_t received = 0;
   unsigned long t0 = millis();
+  const unsigned long ota_start = t0;   // §SEC-3: absolutes Gesamtbudget (t0 wird pro Byte-Fortschritt zurueckgesetzt)
   int lastPct = -1;
   LOGI("OTA", String("start, size=") + contentLength + " bytes");
-  while (received < contentLength && !elapsed(millis(), t0, BODY_RD_TIMEOUT)) {
+  while (received < contentLength && !elapsed(millis(), t0, BODY_RD_TIMEOUT)
+         && !elapsed(millis(), ota_start, OTA_TIMEOUT_TOTAL_MS)) {
     int n = c.read(buf, min((int)BUFSZ, (int)(contentLength - received)));
     if (n > 0) {
       feedWdt();
@@ -1494,6 +1549,18 @@ static void apiReboot(NetworkClient &c, const String &body) {
 }
 
 // ==== Router ====
+// §SEC-1 CSRF: prueft Origin/Referer gegen den Host. Leerer Origin (curl/native) -> erlaubt
+// (LAN-direkt ist im Threat-Model akzeptiert); fremde Authority (Browser-cross-origin) -> false.
+static bool originIsSelf(const String &originRef, const String &host) {
+  if (originRef.length() == 0) return true;
+  if (host.length() == 0)      return true;   // kein Host-Header -> nicht entscheidbar, nicht blocken
+  int s = originRef.indexOf(F("://"));
+  String auth = (s >= 0) ? originRef.substring(s + 3) : originRef;
+  int slash = auth.indexOf('/');
+  if (slash >= 0) auth = auth.substring(0, slash);   // authority = host[:port]
+  return auth.equalsIgnoreCase(host);
+}
+
 static void handleClient(NetworkClient &c) {
   g_reqStart = millis();  // [Spec §3.1] 10s-Gesamtbudget ab erster Zeile (OTA-Body liest direkt via c.read())
   String rl;
@@ -1505,9 +1572,13 @@ static void handleClient(NetworkClient &c) {
   if (q >= 0) path = pathQuery.substring(0, q);  // Query wird in der JSON-API nicht genutzt
 
   size_t contentLength = 0;
-  String contentType;
-  if (!readHeaders(c, contentLength, contentType)) { httpSend400(c, "bad headers"); return; }
+  String contentType, host, originRef;
+  if (!readHeaders(c, contentLength, contentType, host, originRef)) { httpSend400(c, "bad headers"); return; }
   // bewusst KEIN Request-Logging (NVS-Wear + Heap-Churn, Spec §3.5)
+
+  // §SEC-1 CSRF: cross-origin Browser-POSTs (fremder Origin/Referer) auf state-changing Routen
+  // ablehnen. curl/native (kein Origin) bleibt erlaubt -> /ota-Recovery via curl unberuehrt.
+  if (method == "POST" && !originIsSelf(originRef, host)) { httpSend403(c, "cross-origin POST blocked"); return; }
 
   // --- GET ---
   if (method == "GET") {
@@ -1612,6 +1683,7 @@ static void networkTask(void *arg) {
     }
 
     telemDrain();   // Telemetrie -> MQTT publishen (Netz-Kontext)
+    mqttOpDrain();  // §A1: marshallte MQTT-Ops aus applyDo (Core 1) hier ausfuehren
     logDrain();     // Log-Queue -> gLogBuf
     delay(2);
   }
