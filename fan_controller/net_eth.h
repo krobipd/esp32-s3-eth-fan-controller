@@ -18,12 +18,16 @@
 #define ETH_PIN_RST    9
 #define ETH_SPI_MHZ   20
 
-// Liveness-Flags, vom async Event-Callback gesetzt (in Stufe 3 wird der Zugriff atomar)
+// Liveness-Flags, vom async Event-Callback gesetzt.
+// ⚠️ §E2: auf Dateiebene static — korrekt nur, solange der Sketch EINE Uebersetzungseinheit
+// ist. Bei einer Aufteilung auf mehrere .cpp bekaeme jede ihre eigene Kopie und die
+// Netz-Zustaende liefen auseinander. Einzelheiten: concurrency.h, gleicher Hinweis.
 static volatile bool g_ethLinkUp = false;
 static volatile bool g_ethHasIp  = false;
 
-// Logger aus dem Hauptsketch (static, gleiche TU) — forward-deklariert.
-static void logFmt(char level, const char *tag, const char *msg);
+// §E3: Logger als eigener Header — vorher wurde logFmt() hier vorwaerts deklariert und aus
+// dem Hauptsketch erwartet; das Netz-Modul haing also am Sketch statt umgekehrt.
+#include "fan_log.h"
 #define NETLOGI(t, m) logFmt('I', t, m)
 #define NETLOGW(t, m) logFmt('W', t, m)
 #define NETLOGE(t, m) logFmt('E', t, m)
@@ -31,11 +35,11 @@ static void logFmt(char level, const char *tag, const char *msg);
 static void onEthEvent(arduino_event_id_t event, arduino_event_info_t info) {
   (void)info;
   switch (event) {
-    case ARDUINO_EVENT_ETH_START:        NETLOGI("ETH", "started"); break;
-    case ARDUINO_EVENT_ETH_CONNECTED:    g_ethLinkUp = true;  NETLOGI("ETH", "link up"); break;
-    case ARDUINO_EVENT_ETH_GOT_IP:       g_ethHasIp = true;   NETLOGI("ETH", "got IP"); break;
-    case ARDUINO_EVENT_ETH_LOST_IP:      g_ethHasIp = false;  NETLOGW("ETH", "lost IP"); break;
-    case ARDUINO_EVENT_ETH_DISCONNECTED: g_ethLinkUp = false; g_ethHasIp = false; NETLOGW("ETH", "link down"); break;
+    case ARDUINO_EVENT_ETH_START:        NETLOGI("ETH", "Treiber gestartet"); break;
+    case ARDUINO_EVENT_ETH_CONNECTED:    g_ethLinkUp = true;  NETLOGI("ETH", "Verbindung steht"); break;
+    case ARDUINO_EVENT_ETH_GOT_IP:       g_ethHasIp = true;   NETLOGI("ETH", "IP-Adresse bezogen"); break;
+    case ARDUINO_EVENT_ETH_LOST_IP:      g_ethHasIp = false;  NETLOGW("ETH", "IP-Adresse verloren"); break;
+    case ARDUINO_EVENT_ETH_DISCONNECTED: g_ethLinkUp = false; g_ethHasIp = false; NETLOGW("ETH", "Verbindung weg"); break;
     default: break;
   }
 }
@@ -61,7 +65,7 @@ static void ethStartMdns() {
     MDNS.addService("http", "tcp", 80);
     NETLOGI("MDNS", ETH_HOSTNAME ".local");
   } else {
-    NETLOGW("MDNS", "begin failed");
+    NETLOGW("MDNS", "Start fehlgeschlagen");
   }
 }
 

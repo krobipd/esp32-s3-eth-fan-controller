@@ -22,6 +22,8 @@ struct ApplyJob;
 #include <Preferences.h>
 
 #include "fw_util.h"
+#include "fan_logic.h"   // §E1: reine, host-getestete Logik
+#include "fan_log.h"     // §E1/§E3: Logger (auch von net_eth.h genutzt)
 #include "concurrency.h"   // Stufe 3: Cross-Core-Queues (Telemetrie/Duty/...)
 #include "net_eth.h"   // nativer W5500-Treiber (ETH.h) + Link-Events; ersetzt Ethernet.h
 
@@ -53,7 +55,7 @@ static const uint32_t OTA_HEALTH_MS = 90000;
 // ==== Limits & Timing ====
 // ==== Version (Semver, EINZIGE Quelle der Wahrheit) ====
 // Bumpen + git-Tag vX.Y.Z müssen zusammenpassen. MAJOR=Architektur/Breaking, MINOR=Feature, PATCH=Fix.
-#define FW_VERSION "5.4.3"
+#define FW_VERSION "5.5.0"
 
 static const uint8_t  MAX_FANS              = 8;
 // §4.7: Arduino-loopTask laeuft auf Core 1 = Control-Core. ISR-/PCNT-/LEDC-Registrierung MUSS
@@ -80,9 +82,8 @@ static const unsigned long CLIENT_RD_TIMEOUT = 3000;   // Stall-Budget pro Zeile
 static const unsigned long BODY_RD_TIMEOUT   = 30000;  // Stall-Budget Body/OTA (t0 reset bei Fortschritt)
 static const unsigned long HTTP_REQ_BUDGET_MS = 10000; // Gesamtbudget Nicht-OTA-Request (Spec §3.1)
 static const unsigned long OTA_TIMEOUT_TOTAL_MS = 300000; // §SEC-3: absolutes OTA-Transfer-Budget (5 min) gegen Trickle-DoS
-static const size_t        LOG_MAX           = 8192;
 static const uint32_t      LOG_FLUSH_MS      = 600000;  // 10 min — NVS-Wear (Spec §3.5)
-static const size_t        LOG_NVS_MAX       = 1600;
+// LOG_MAX / LOG_LINE_MAX / LOG_NVS_MAX stehen in fan_log.h
 
 // Storm-Shield & Filter
 static const uint16_t ISR_STORM_BUDGET   = 9000;
@@ -113,18 +114,7 @@ static const uint8_t TACH_ALLOWED[] = {
 #define COUNT_OF(a) (sizeof(a) / sizeof((a)[0]))
 
 // ==== Pin-Validierung ====
-static inline bool isPinBlocked(uint8_t pin) {
-  if (pin >= 9 && pin <= 14) return true;   // W5500
-  if (pin == 19 || pin == 20) return true;  // USB CDC
-  if (pin == 0 || pin == 3) return true;    // Boot/JTAG
-  if (pin >= 43 && pin <= 46) return true;  // Strapping
-  if (pin == 0xFF) return true;
-  return false;
-}
-static inline bool inList(uint8_t pin, const uint8_t *lst, size_t n) {
-  for (size_t i = 0; i < n; i++) if (lst[i] == pin) return true;
-  return false;
-}
+// §E1: isPinBlocked() und inList() liegen jetzt in fan_logic.h (host-getestet).
 static inline bool isPwmAllowed(uint8_t pin)  { return pin != 0xFF && !isPinBlocked(pin) && inList(pin, PWM_ALLOWED, COUNT_OF(PWM_ALLOWED)); }
 static inline bool isTachAllowed(uint8_t pin) { return pin != 0xFF && !isPinBlocked(pin) && inList(pin, TACH_ALLOWED, COUNT_OF(TACH_ALLOWED)); }
 static inline bool canAttachInterruptPin(uint8_t pin) {
@@ -145,8 +135,7 @@ struct MQTTConfig {
 } mqttConfig;
 
 // ==== System State ====
-static String   gLogBuf, gPrevLogTail;
-static uint32_t g_bootCount = 0;
+static String   gPrevLogTail;
 static bool     g_crashLoopDetected = false;
 static String   g_resetReasonStr = "OTHER";
 static std::atomic<uint32_t> g_minFreeHeap{UINT32_MAX};
@@ -155,86 +144,47 @@ static uint8_t  g_mac[6];
 static uint8_t  g_crashStreak = 0;
 
 // ==== Logger ====
-static inline const char *resetReasonStr(esp_reset_reason_t r) {
-  switch (r) {
-    case ESP_RST_POWERON:   return "POWERON";
-    case ESP_RST_EXT:       return "EXT";
-    case ESP_RST_SW:        return "SW";
-    case ESP_RST_PANIC:     return "PANIC";
-    case ESP_RST_INT_WDT:   return "INT_WDT";
-    case ESP_RST_TASK_WDT:  return "TASK_WDT";
-    case ESP_RST_WDT:       return "WDT";
-    case ESP_RST_BROWNOUT:  return "BROWNOUT";
-    case ESP_RST_DEEPSLEEP: return "DEEPSLEEP";
-    case ESP_RST_SDIO:      return "SDIO";
-    default:                return "OTHER";
-  }
+// §E1/§E3: liegt jetzt vollstaendig in fan_log.h — siehe Include oben.
+
+// §B2: Preferences::begin() schlaegt bei vollem oder beschaedigtem NVS fehl. Vorher wurde die
+// Rueckgabe an 15 Stellen ignoriert — alle put() liefen dann ins Leere und Konfiguration,
+// Drehzahlen und Log-Tail gingen still verloren. Ein Helfer statt 15 Einzelpruefungen.
+static bool nvsOpen(Preferences &p, const char *ns, bool readOnly) {
+  if (p.begin(ns, readOnly)) return true;
+  LOGW("NVS", String("Namespace '") + ns + "' laesst sich nicht oeffnen");
+  return false;
 }
-
-// §4.6: gLogBuf (Heap-String) wird von beiden Cores beruehrt -> Mutex. Producer (LOG-Makros)
-// posten in die Log-Queue (thread-safe, nie blockierend); EIN Consumer (logDrain) haengt an.
-static SemaphoreHandle_t logMutex = nullptr;
-static inline void logLock()   { if (logMutex) xSemaphoreTake(logMutex, portMAX_DELAY); }
-static inline void logUnlock() { if (logMutex) xSemaphoreGive(logMutex); }
-
-// Consumer-Seite: haengt eine Zeile an gLogBuf (mit Ringkuerzung). NUR via logDrain (ein Task).
-static void logLine(const char *s) {
-  size_t slen = strlen(s);
-  logLock();
-  if (gLogBuf.length() + slen + 1 > LOG_MAX) {
-    int cut = (gLogBuf.length() + slen + 1) - LOG_MAX + 256;
-    if (cut < (int)gLogBuf.length()) gLogBuf.remove(0, cut);
-    else gLogBuf = "";
-  }
-  gLogBuf += s; gLogBuf += '\n';
-  logUnlock();
-}
-
-// Producer-Seite (beide Cores): sofort auf Serial (Debug) + in die Log-Queue (gLogBuf via Consumer).
-// Lokaler Puffer statt geteiltem Static -> thread-safe ohne Lock im Hot-Path.
-static void logFmt(char level, const char *tag, const char *msg) {
-  char line[128];
-  uint32_t ms = millis();
-  snprintf(line, sizeof(line),
-           "[T+%04lu.%03lus #%lu] [%c] %s: %s",
-           (unsigned long)(ms / 1000UL), (unsigned long)(ms % 1000UL),
-           (unsigned long)g_bootCount, level, tag, msg);
-  Serial.println(line);
-  logPost(line);
-}
-
-// Leert die Log-Queue in gLogBuf. NUR aus EINEM Task (Loop bis Task 8, dann networkTask).
-static void logDrain() {
-  if (!g_logQ) return;
-  LogLine l;
-  while (xQueueReceive(g_logQ, &l, 0) == pdTRUE) logLine(l.text);
-}
-
-#define LOGI(t, m) logFmt('I', t, (String(m)).c_str())
-#define LOGW(t, m) logFmt('W', t, (String(m)).c_str())
-#define LOGE(t, m) logFmt('E', t, (String(m)).c_str())
 
 static void persistLogTail() {
-  logLock();                          // §4.6: gLogBuf-Snapshot unter Lock (Consumer haengt evtl. parallel an)
-  if (gLogBuf.isEmpty()) { logUnlock(); return; }
-  String tail = gLogBuf;
-  logUnlock();
-  if (tail.length() > (int)LOG_NVS_MAX) tail.remove(0, tail.length() - LOG_NVS_MAX);
-  Preferences p; p.begin("sys", false);
+  size_t n = logSnapshot();           // §4.6: unter Lock kopiert, dann Lock frei
+  if (n == 0) return;
+  const char *tail = gLogSnap;        // nur den Schwanz schreiben, nicht die ganzen 8 KB
+  if (n > LOG_NVS_MAX) tail = gLogSnap + (n - LOG_NVS_MAX);
+  Preferences p;
+  if (!nvsOpen(p, "sys", false)) return;
   p.putString("log_tail", tail);
   p.end();
 }
 static void loadPrevLogTail() {
-  Preferences p; p.begin("sys", true);
+  Preferences p;
+  if (!nvsOpen(p, "sys", true)) return;
   gPrevLogTail = p.getString("log_tail", "");
   p.end();
 }
 static void bootTrackInit() {
-  Preferences p; p.begin("sys", false);
+  esp_reset_reason_t rr0 = esp_reset_reason();
+  Preferences p;
+  if (!nvsOpen(p, "sys", false)) {
+    // Ohne NVS kein Crash-Streak — lieber ohne Safe-Mode weiterlaufen als gar nicht booten.
+    g_resetReasonStr = resetReasonStr(rr0);
+    g_bootCount = 1; g_crashStreak = 0; g_crashLoopDetected = false;
+    LOGW("BOOT", String("Reset: ") + g_resetReasonStr + " | NVS nicht verfuegbar, kein Crash-Tracking");
+    return;
+  }
   uint32_t prevBoots = p.getUInt("boots", 0);
   uint8_t crashStreak = p.getUChar("crash_streak", 0);
 
-  esp_reset_reason_t rr = esp_reset_reason();
+  const esp_reset_reason_t rr = rr0;
   g_resetReasonStr = resetReasonStr(rr);
 
   bool isCrash = (rr == ESP_RST_INT_WDT || rr == ESP_RST_TASK_WDT || rr == ESP_RST_WDT || rr == ESP_RST_PANIC);
@@ -256,39 +206,24 @@ static void bootTrackInit() {
 }
 
 // ==== URL/Form Helpers ====
-static char fromHex(char c) {
-  if (c >= '0' && c <= '9') return c - '0';
-  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-  return 0;
-}
-static String urlDecode(const String &s) {
-  String o; o.reserve(s.length());
-  for (size_t i = 0; i < s.length(); i++) {
-    char c = s[i];
-    if (c == '+') o += ' ';
-    else if (c == '%' && i + 2 < s.length()) { char h = (fromHex(s[i+1]) << 4) | fromHex(s[i+2]); o += h; i += 2; }
-    else o += c;
-  }
-  return o;
-}
+// §E1: Die eigentliche Parser-Logik liegt host-getestet in fan_logic.h. Hier bleiben duenne
+// Anpassungen an die Arduino-String-Aufrufer. Nebenwirkung: formGet trifft jetzt nur noch auf
+// FELDGRENZEN — vorher haette der Schluessel "pct" auch in "maxpct=50" angeschlagen.
 static bool formGet(const String &body, const String &key, String &out) {
-  String k = key + "="; int p = body.indexOf(k); if (p < 0) return false;
-  int s = p + k.length(); int e = body.indexOf('&', s);
-  out = urlDecode((e < 0) ? body.substring(s) : body.substring(s, e)); return true;
+  char buf[256];
+  if (!formGetInto(body.c_str(), key.c_str(), buf, sizeof(buf))) { out = ""; return false; }
+  out = buf;
+  return true;
 }
 static inline void safeStrcpy(char *dst, size_t cap, const String &src) {
   size_t n = min(cap - 1, (size_t)src.length()); memcpy(dst, src.c_str(), n); dst[n] = 0;
 }
+// §E1: Regel liegt host-getestet in fan_logic.h — dieselbe Regel bildet der Mock nach,
+// beide Seiten sind jetzt festgenagelt (Host-Test + tools/test_mock.py).
 static String sanitizeName(const String &in) {
-  String s = in; s.trim(); String out;
-  for (size_t i = 0; i < s.length(); i++) {
-    char c = s[i]; if (c == ' ') c = '_';
-    if (c >= 'A' && c <= 'Z') c = c - 'A' + 'a';
-    if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '-') out += c;
-  }
-  if (out.isEmpty()) out = "fan";
-  return out;
+  char buf[20];
+  sanitizeNameInto(in.c_str(), buf, sizeof(buf));
+  return String(buf);
 }
 
 // ==== Fan Faults & Datenmodell ====
@@ -326,7 +261,7 @@ struct Fan {
 
   bool     validated;
   FanFault fault;
-  uint8_t  faultCount;
+  // [D1] faultCount entfernt — wurde gepflegt, aber nirgends gelesen
   uint32_t stormSinceMs;
   bool     stormActive;
 
@@ -340,30 +275,32 @@ static Fan fans[MAX_FANS] = { 0 };
 // [B6] lastValidateMs entfernt
 static void fanInitDefaults(uint8_t idx) {
   Fan &f = fans[idx];
+  f.name[0] = 0;                      // §F4: der Name gehoert zu den Defaults — sonst haelt die
+                                      // Funktion nur, weil der einzige Aufrufer ihn danach setzt
   f.pwmPin = 0xFF; f.tachPin = 0xFF; f.invertPwm = false;
   f.duty = 0; f.calMinStart = 0; f.calNote[0] = 0;
   f.pulseCount = 0; f.lastPulseCount = 0;
   f.rpmShown = 0; f.rpmRawA = 0; f.rpmRawB = 0; f.rpmRawC = 0; f.rpmEma = 0;
   f.lastRpmPubMs = 0;
   f.pcntEnabled = false; f.pcntUnit = PCNT_UNIT_0;
-  f.validated = false; f.fault = FF_OK; f.faultCount = 0;
+  f.validated = false; f.fault = FF_OK;
   f.stormSinceMs = 0; f.stormActive = false; f.burstLeft = 0; f.measureSuspended = false;
   f.lastEdgeUs = 0;
-  uint32_t minPulse = (uint32_t)((60UL * 1000000UL) / max<uint32_t>(1, (uint32_t)MAX_EXPECTED_RPM * PULSES_PER_REV));
-  f.minPulseUs = max<uint32_t>(MIN_PULSE_US_FLOOR, minPulse / 3);
+  f.minPulseUs = computeMinPulseUs(255);   // §E1: kuerzeste erwartete Impulsdauer bei Vollgas
 }
 
 // [B5] saveFanToNVS entfernt (Dead Code)
 
+// §F5: Eintraege ENTFERNEN statt sie mit Leerwerten zu ueberschreiben — so wie applyDo es
+// im "state"-Namespace schon macht. Leere Eintraege belegten weiter NVS-Platz.
 static void clearFanNVS(uint8_t idx) {
-  Preferences p; p.begin("fans", false);
-  String k = "f" + String(idx) + "_";
-  p.putUChar((k + "pwm").c_str(),  0xFF);
-  p.putUChar((k + "tac").c_str(),  0xFF);
-  p.putUChar((k + "inv").c_str(),  0);
-  p.putUChar((k + "cmin").c_str(), 0);
-  p.putString((k + "cnote").c_str(), "");
-  p.putString((k + "name").c_str(), "");
+  Preferences p;
+  if (!nvsOpen(p, "fans", false)) return;
+  static const char *SUFFIXE[] = { "pwm", "tac", "inv", "cmin", "cnote", "name" };
+  for (size_t i = 0; i < COUNT_OF(SUFFIXE); i++) {
+    char k[16]; snprintf(k, sizeof(k), "f%u_%s", (unsigned)idx, SUFFIXE[i]);
+    p.remove(k);
+  }
   p.end();
 }
 
@@ -387,9 +324,7 @@ static inline bool validTachForFan(uint8_t p, int8_t ignoreIndex) {
   return isTachAllowed(p) && !pinInUse(p, ignoreIndex) && canAttachInterruptPin(p);
 }
 static void fanMarkFault(uint8_t idx, FanFault ff) {
-  Fan &f = fans[idx];
-  if (f.fault != ff) f.faultCount = 0;
-  f.fault = ff; f.faultCount++;
+  fans[idx].fault = ff;
 }
 static void fanAutoValidate(uint8_t idx) {
   Fan &f = fans[idx];
@@ -406,6 +341,7 @@ static std::atomic<uint32_t> g_stateRev{0};
 // Loop-Task sie schreibt — plus die Pending-Cleanup-Liste. Disziplin: NIE ueber Socket-I/O
 // (mqtt.publish) halten -> unter Lock snapshotten, Lock freigeben, DANN senden. Fundament fuer
 // den Dual-Core-Split (Stufe 3); behebt heute schon den §19-Datarace Loop<->esp-mqtt-Task.
+static StaticSemaphore_t fansMutexBuf;
 static SemaphoreHandle_t fansMutex = nullptr;
 static PendingCleanup    g_pendingCleanup = {};
 static inline void fansLock()   { if (fansMutex) xSemaphoreTake(fansMutex, portMAX_DELAY); }
@@ -415,7 +351,7 @@ static void pendingCleanupQueue(const char *sanitizedName) {
   fansLock();
   bool ok = pendingCleanupAdd(g_pendingCleanup, sanitizedName);
   fansUnlock();
-  if (!ok) LOGW("MQTT", "cleanup-Liste voll - Topic verwaist");
+  if (!ok) LOGW("MQTT", "Aufraeum-Liste voll — Topic bleibt verwaist");
 }
 
 // ==== Netz/MQTT-Objekte (nativer ETH.h-Stack) ====
@@ -428,12 +364,20 @@ static String    g_mqttLwtTopic;
 static String topicDev() { return String(mqttConfig.prefix) + "/" + deviceId; }
 // Flaches Schema (Spec §4): <prefix>/<deviceId>/<name>/{speed,set,rpm}
 // §19: Namen unter Lock snapshotten — der Loop-Task kann fans[i].name gerade memset/strcpy'en.
-static String topicFan(uint8_t i) {
-  char name[20]; uint8_t n = 0;
+// §C1: Der Namens-Snapshot unter fansLock stand fuenfmal fast identisch im Code. Eine
+// Funktion macht die Lock-Disziplin an EINER Stelle pruefbar statt an fuenf.
+// §19: fans[i].name wird vom Control-Core geschrieben, waehrend Netz-/MQTT-Task liest.
+static void fanNameSnapshot(uint8_t idx, char *out, size_t cap) {
+  size_t n = 0;
   fansLock();
-  for (; n < sizeof(name) - 1 && fans[i].name[n]; n++) name[n] = fans[i].name[n];
-  name[n] = 0;
+  for (; n + 1 < cap && fans[idx].name[n]; n++) out[n] = fans[idx].name[n];
   fansUnlock();
+  out[n] = 0;
+}
+
+static String topicFan(uint8_t i) {
+  char name[20];
+  fanNameSnapshot(i, name, sizeof(name));
   return topicDev() + "/" + sanitizeName(String(name));
 }
 
@@ -449,7 +393,7 @@ static void safetyZeroPins() {
     uint8_t p = PWM_ALLOWED[k];
     if (!isPinBlocked(p)) { pinMode(p, OUTPUT); digitalWrite(p, LOW); }
   }
-  LOGI("SAFETY", "All PWM pins LOW");
+  LOGI("SAFETY", "Alle PWM-Pins auf LOW");
 }
 
 // ==== Device-ID & MAC ====
@@ -479,7 +423,7 @@ static void disableRadios() {
     (void)esp_bt_controller_deinit();
   }
 #endif
-  LOGI("RADIO", "WiFi/BT disabled");
+  LOGI("RADIO", "WLAN und Bluetooth abgeschaltet");
 }
 
 // ==== W5500 Reset ====
@@ -497,34 +441,50 @@ static void stateScheduleDutySave(uint8_t idx, uint8_t duty) {
 static void stateFlushIfNeeded(uint32_t now) {
   if (g_crashLoopDetected) return;  // Safe-Mode-Failsafe-Duties nie in NVS schreiben
   if (!elapsed(now, g_lastStateWriteMs, STATE_WRITE_DEBOUNCE_MS)) return;
-  Preferences p; p.begin("state", false);
+
+  // §A1: ZUERST pruefen, ob ueberhaupt etwas zu schreiben ist — vorher wurde bei JEDEM
+  // Loop-Durchlauf (~400x/s) ein NVS-Handle geoeffnet und geschlossen, weil
+  // g_lastStateWriteMs nur im Schreibfall nachgefuehrt wurde und elapsed() daher im
+  // Normalzustand dauerhaft wahr blieb. Kein Flash-Wear (es lief kein put), aber CPU und
+  // der globale NVS-Mutex auf dem Control-Core, gegen den jeder Zugriff aus applyDo anlief.
+  bool dirty = false;
+  for (uint8_t i = 0; i < MAX_FANS; i++)
+    if (fanPresentIdx(i) && g_stateDirty[i]) { dirty = true; break; }
+  if (!dirty) { g_lastStateWriteMs = now; return; }   // Fenster weiterschieben, nichts oeffnen
+
+  Preferences p;
+  if (!nvsOpen(p, "state", false)) return;
   bool wrote = false;
   for (uint8_t i = 0; i < MAX_FANS; i++) {
     if (!fanPresentIdx(i) || !g_stateDirty[i]) continue;
-    String k = "f" + String(i) + "_duty";
-    p.putUChar(k.c_str(), fans[i].duty);
+    char k[16]; snprintf(k, sizeof(k), "f%u_duty", (unsigned)i);
+    p.putUChar(k, fans[i].duty);
     g_lastSavedDuty[i] = fans[i].duty;
     g_stateDirty[i] = false;
     wrote = true;
   }
   p.end();
-  if (wrote) { g_lastStateWriteMs = now; LOGI("STATE", "duties persisted"); }
+  g_lastStateWriteMs = now;
+  if (wrote) LOGI("STATE", "Drehzahl-Sollwerte gesichert");
 }
 
 // ==== Config laden ====
 static void loadConfigFans() {
-  Preferences p; p.begin("fans", true);
+  for (uint8_t i = 0; i < MAX_FANS; i++) fanInitDefaults(i);   // §F4: Defaults immer setzen
+  Preferences p;
+  if (!nvsOpen(p, "fans", true)) { LOGW("PREFS", "Luefter-Konfiguration nicht lesbar"); return; }
   for (uint8_t i = 0; i < MAX_FANS; i++) {
-    fanInitDefaults(i);
-    String k = "f" + String(i) + "_";
-    fans[i].pwmPin     = p.getUChar((k + "pwm").c_str(),  0xFF);
-    fans[i].tachPin    = p.getUChar((k + "tac").c_str(),  0xFF);
-    fans[i].invertPwm  = p.getUChar((k + "inv").c_str(),  0) == 1;
-    fans[i].calMinStart = p.getUChar((k + "cmin").c_str(), 0);
-    String n  = p.getString((k + "cnote").c_str(), "");
-    String nm = p.getString((k + "name").c_str(), "");
-    safeStrcpy(fans[i].calNote, sizeof(fans[i].calNote), n);
-    safeStrcpy(fans[i].name,    sizeof(fans[i].name),    nm);
+    // Schluessel per snprintf statt String-Konkatenation: spart 6 Heap-Allokationen je
+    // Luefter beim Boot, genau dann, wenn der Heap noch unfragmentiert bleiben soll.
+    char k[16];
+    #define FANKEY(suffix) (snprintf(k, sizeof(k), "f%u_" suffix, (unsigned)i), k)
+    fans[i].pwmPin      = p.getUChar(FANKEY("pwm"),  0xFF);
+    fans[i].tachPin     = p.getUChar(FANKEY("tac"),  0xFF);
+    fans[i].invertPwm   = p.getUChar(FANKEY("inv"),  0) == 1;
+    fans[i].calMinStart = p.getUChar(FANKEY("cmin"), 0);
+    safeStrcpy(fans[i].calNote, sizeof(fans[i].calNote), p.getString(FANKEY("cnote"), ""));
+    safeStrcpy(fans[i].name,    sizeof(fans[i].name),    p.getString(FANKEY("name"),  ""));
+    #undef FANKEY
 
     if (!isPwmAllowed(fans[i].pwmPin))   fans[i].pwmPin  = 0xFF;
     if (!isTachAllowed(fans[i].tachPin)) fans[i].tachPin = 0xFF;
@@ -533,10 +493,11 @@ static void loadConfigFans() {
     fans[i].duty = 0;
   }
   p.end();
-  LOGI("PREFS", "Fan config loaded");
+  LOGI("PREFS", "Luefter-Konfiguration geladen");
 }
 static void loadMQTTConfig() {
-  Preferences p; p.begin("mqtt", true);
+  Preferences p;
+  if (!nvsOpen(p, "mqtt", true)) { LOGW("PREFS", "MQTT-Konfiguration nicht lesbar"); return; }
   if (p.isKey("enabled")) {
     mqttConfig.enabled = p.getBool("enabled", false);
     p.getString("host",   mqttConfig.host,   sizeof(mqttConfig.host));
@@ -563,10 +524,9 @@ static void jsonPrintEscaped(NetworkClient &c, const char *s) {
 }
 
 // ==== PWM setzen ====
+// §E1: Rechnung liegt in fan_logic.h (host-getestet); hier nur die Projekt-Konstanten.
 static inline uint32_t computeMinPulseUs(uint8_t duty) {
-  uint32_t rpmExp = (uint32_t)MAX_EXPECTED_RPM * duty / 255; rpmExp = max<uint32_t>(rpmExp, 1);
-  uint32_t periodUs = (60UL * 1000000UL) / (rpmExp * PULSES_PER_REV);
-  return max<uint32_t>(MIN_PULSE_US_FLOOR, periodUs / 3);
+  return computeMinPulseUs(duty, MAX_EXPECTED_RPM, PULSES_PER_REV, MIN_PULSE_US_FLOOR);
 }
 static void fanSetDuty(Fan &f, uint8_t duty) {
   if (duty > 0 && f.calMinStart > 0 && duty < f.calMinStart) duty = f.calMinStart;
@@ -580,7 +540,7 @@ static void fanSetDuty(Fan &f, uint8_t duty) {
 static void onDutyChanged(uint8_t idx) {
   if (idx >= MAX_FANS || !fanPresentIdx(idx)) return;
   stateScheduleDutySave(idx, fans[idx].duty);
-  TelemetrySample s = { idx, TELEM_SPEED, fans[idx].duty, 0, (uint8_t)fans[idx].fault };  // §4.1: Control postet
+  TelemetrySample s = { idx, TELEM_SPEED, fans[idx].duty, 0 };   // §4.1: Control postet
   telemPost(s);
 }
 
@@ -639,7 +599,7 @@ static bool enablePcntForFan(uint8_t idx, pcnt_unit_t unit) {
   cfg.counter_l_lim  = -32768;
 
   if (pcnt_unit_config(&cfg) != ESP_OK) {
-    LOGW("PCNT", String("unit_config fail fan=") + idx);
+    LOGW("PCNT", String("Zaehler-Konfiguration fehlgeschlagen, Luefter ") + idx);
     return false;
   }
   pcnt_set_filter_value(cfg.unit, PCNT_FILTER_CYCLES);
@@ -659,9 +619,9 @@ static void enableIsrForFan(uint8_t idx) {
   Fan &f = fans[idx];
   if (canAttachInterruptPin(f.tachPin)) {
     attachInterrupt(digitalPinToInterrupt(f.tachPin), tachISRs[idx], FALLING);
-    LOGI("ISR", String("attach fan=") + idx + " gpio=" + (int)f.tachPin);
+    LOGI("ISR", String("Tacho-Interrupt aktiv, Luefter ") + idx + " GPIO " + (int)f.tachPin);
   } else {
-    LOGW("ISR", String("no irq fan=") + idx + " gpio=" + (int)f.tachPin);
+    LOGW("ISR", String("kein Interrupt moeglich, Luefter ") + idx + " GPIO " + (int)f.tachPin);
   }
 }
 
@@ -719,7 +679,7 @@ static inline void stormTrip(uint8_t i) {
   f.rpmRawA = f.rpmRawB = f.rpmRawC = 0;
   f.rpmEma  = 0;
   f.rpmShown = 0;
-  LOGW("STORM", String("fan=") + i + " cooldown");
+  LOGW("STORM", String("Impulsflut an Luefter ") + i + " — Messung pausiert");
 }
 static inline void stormTryRecover(uint8_t i) {
   Fan &f = fans[i];
@@ -732,7 +692,7 @@ static inline void stormTryRecover(uint8_t i) {
   rebuildPcntMap();
   f.measureSuspended = false;
   fanMarkFault(i, FF_OK);
-  LOGI("STORM", String("fan=") + i + " recovered");
+  LOGI("STORM", String("Luefter ") + i + " misst wieder");
 }
 
 // ==== Deferred Apply ====
@@ -753,12 +713,19 @@ struct ApplyJob {
 };
 
 // §4.2: Apply-Job-Queue (by value) Core0->Core1, ersetzt g_apply[]/g_anyApplyPending.
-static void applyQueue(uint8_t idx, const ApplyJob &src) {
-  if (idx >= MAX_FANS || !g_applyQ) return;
+// §B3: Rueckgabe pruefen und melden — vorher wurde ein voller Puffer STILL verworfen,
+// waehrend das Schwestermodul mqttOpPost denselben Fall meldet. Der Aufrufer entscheidet
+// jetzt anhand des Ergebnisses, ob er Erfolg oder Fehler an die Oberflaeche zurueckgibt.
+static bool applyQueue(uint8_t idx, const ApplyJob &src) {
+  if (idx >= MAX_FANS || !g_applyQ) return false;
   ApplyJob j = src; j.idx = idx; j.active = true;
-  xQueueSend(g_applyQ, &j, 0);   // Drop bei Voll (UI macht eine Aktion/Mal; Loop drained jeden Durchlauf)
-  LOGI("APPLY", String("queued idx=") + idx + " del=" + (src.deleteFan ? "1" : "0") +
+  if (xQueueSend(g_applyQ, &j, 0) != pdTRUE) {
+    LOGW("APPLY", String("Auftrags-Puffer voll — Aenderung an Luefter ") + idx + " verworfen");
+    return false;
+  }
+  LOGI("APPLY", String("eingereiht idx=") + idx + " del=" + (src.deleteFan ? "1" : "0") +
        " pins=" + (src.pinsChanged ? "1" : "0") + " name=" + (src.nameChanged ? "1" : "0"));
+  return true;
 }
 
 // ==== Duty-Queue (§4.2: FreeRTOS-Queue Core0->Core1, ersetzt g_pendingDuty[]) ====
@@ -782,10 +749,15 @@ static void dutyProcessQueue() {
 // ==== MQTT Publish/Subscribe ====
 static uint16_t g_lastRpmSent[MAX_FANS] = {0};
 
+// §C5: EINE Stelle, die den Speed-Payload baut und sendet — vorher taten das
+// mqttPublishSpeed und der TELEM_SPEED-Zweig in telemDrain getrennt voneinander.
+static void mqttSendSpeed(const String &base, uint8_t duty) {
+  char b[4]; snprintf(b, sizeof(b), "%u", (unsigned)pctFromDuty(duty));
+  mqtt.publish((base + "/speed").c_str(), b, 0, true);
+}
 static void mqttPublishSpeed(uint8_t i) {
   if (!mqtt.isConnected() || !fanPresentIdx(i)) return;
-  char b[4]; snprintf(b, sizeof(b), "%u", (unsigned)pctFromDuty(fans[i].duty));
-  mqtt.publish((topicFan(i) + "/speed").c_str(), b, 0, true);
+  mqttSendSpeed(topicFan(i), fans[i].duty);
 }
 
 // §4.1: RPM-Telemetrie posten statt direkt publishen. Throttle bleibt PRODUCER-seitig
@@ -799,7 +771,7 @@ static void telemPostRpm(uint8_t i) {
           || elapsed(now, fans[i].lastRpmPubMs, MQTT_PUB_MS_KEEPALIVE)
           || abs((int)rpm - (int)g_lastRpmSent[i]) >= MQTT_RPM_ABS_DELTA;
   if (!due) return;
-  TelemetrySample s = { i, TELEM_RPM, fans[i].duty, rpm, (uint8_t)fans[i].fault };
+  TelemetrySample s = { i, TELEM_RPM, fans[i].duty, rpm };
   telemPost(s);
   fans[i].lastRpmPubMs = now;
   g_lastRpmSent[i] = rpm;
@@ -814,8 +786,7 @@ static void telemDrain() {
     if (!mqtt.isConnected()) continue;          // Queue trotzdem leeren (kein Stau)
     String base = topicFan(s.idx);
     if (s.kind == TELEM_SPEED) {
-      char b[4]; snprintf(b, sizeof(b), "%u", (unsigned)pctFromDuty(s.duty));
-      mqtt.publish((base + "/speed").c_str(), b, 0, true);
+      mqttSendSpeed(base, s.duty);   // §C5
     } else {
       char b[12]; snprintf(b, sizeof(b), "%u", (unsigned)s.rpm);
       mqtt.publish((base + "/rpm").c_str(), b, 0, false);
@@ -828,16 +799,15 @@ static void telemDrain() {
 static void mqttApplySet(uint8_t idx, const std::string &payload) {
   bool hasDigit = false;
   for (char c : payload) if (c >= '0' && c <= '9') { hasDigit = true; break; }
-  if (!hasDigit) { LOGW("MQTT", "set ohne Zahl ignoriert"); return; }
+  if (!hasDigit) { LOGW("MQTT", "Sollwert ohne Zahl — ignoriert"); return; }
   int pct = constrain(atoi(payload.c_str()), 0, 100);
   if (idx < MAX_FANS && fanPresentIdx(idx)) {
     dutyEnqueue(idx, dutyFromPct((uint8_t)pct));   // Cross-Task -> Duty-Queue
-    char nm[20]; fansLock(); { uint8_t n=0; for(; n<19 && fans[idx].name[n]; n++) nm[n]=fans[idx].name[n]; nm[n]=0; } fansUnlock();  // §19: Name fuer Log unter Lock
-    LOGI("MQTT", String("set ") + nm + " -> " + pct + "%");
+    char nm[20]; fanNameSnapshot(idx, nm, sizeof(nm));   // §C1
+    LOGI("MQTT", String("Sollwert ") + nm + " -> " + pct + "%");
   }
 }
 
-static bool                  ethHasIP = false;   // nur im networkTask (Core 0) benutzt
 static std::atomic<bool>     httpUp{false};       // networkTask setzt; Health-Window (loopTask) liest -> Commit-Gate
 static std::atomic<uint32_t> g_netCtr{0};         // networkTask-Heartbeat (Liveness: Commit-Gate + /api/status)
 static std::atomic<uint32_t> g_loopCtr{0};        // Control-Loop-Heartbeat (Liveness)
@@ -881,7 +851,7 @@ static void haClearName(const String &san) {
 // publish=true: number+sensor Config retained (QoS1) publishen; false: leeren. Name unter fansLock.
 static void haDiscoveryFan(uint8_t i, bool publish) {
   if (!mqtt.isConnected() || !fanPresentIdx(i)) return;
-  char nm[20]; fansLock(); { uint8_t n = 0; for (; n < 19 && fans[i].name[n]; n++) nm[n] = fans[i].name[n]; nm[n] = 0; } fansUnlock();
+  char nm[20]; fanNameSnapshot(i, nm, sizeof(nm));   // §C1
   String san = sanitizeName(String(nm));
   if (!publish) { haClearName(san); return; }
   std::string p = mqttConfig.prefix, d = deviceId.c_str(), f = san.c_str(), v = FW_VERSION;
@@ -917,7 +887,7 @@ void onMqttConnect(esp_mqtt_client_handle_t client) {
     mqttPublishSpeed(i);
     if (mqttConfig.haDisc) haDiscoveryFan(i, true);   // §5.5: NUR bei HA an publishen — sonst homeassistant/ NIE anfassen
   }
-  LOGI("MQTT", "connected");
+  LOGI("MQTT", "verbunden");
 }
 
 // Event-Trampolin für esp-mqtt (IDF 5.x), von loopStart() registriert.
@@ -966,15 +936,17 @@ static void applyDo(ApplyJob &j) {
 
     if (f.name[0]) {
       // §A1: MQTT-Cleanup an den Netz-Task (Core 0) marshallen statt hier (Core 1) direkt zu senden.
-      MqttOpJob op{}; op.kind = MQOP_CLEANUP; op.idx = idx;
+      MqttOpJob op{}; op.kind = MQOP_CLEANUP;   // [D3] idx ist bei CLEANUP bedeutungslos
       safeStrcpy(op.name, sizeof(op.name), sanitizeName(String(f.name)));
-      if (!mqttOpPost(op)) LOGW("MQTT", "op-queue voll (cleanup) - Topic verwaist");
+      if (!mqttOpPost(op)) LOGW("MQTT", "MQTT-Auftragspuffer voll — Topic bleibt verwaist");
     }
 
     clearFanNVS(idx);
     // Persistierten Duty im RICHTIGEN Namespace ("state") raeumen + RAM-Tracking nullen,
     // sonst erbt ein neuer Luefter im selben Slot nach Reboot die alte Drehzahl.
-    { Preferences p; p.begin("state", false); p.remove((String("f") + idx + "_duty").c_str()); p.end(); }
+    { Preferences p; if (nvsOpen(p, "state", false)) {
+        char k[16]; snprintf(k, sizeof(k), "f%u_duty", (unsigned)idx);
+        p.remove(k); p.end(); } }
     g_lastSavedDuty[idx] = 0;   // stale DutyCmd in g_dutyQ wird beim Drain via fanPresentIdx verworfen
     g_stateDirty[idx]    = false;
     fansLock();                         // §19: gegen Cross-Task-Leser (topicFan im esp-mqtt-Task)
@@ -985,24 +957,27 @@ static void applyDo(ApplyJob &j) {
 
     rebuildPcntMap();
     g_stateRev.fetch_add(1);
-    LOGI("APPLY", String("deleted idx=") + idx);
+    LOGI("APPLY", String("Luefter ") + idx + " geloescht");
     return;
   }
 
   // Name change
   if (j.nameChanged) {
     if (f.name[0]) {  // §A1: alten Topic raeumen (vor dem Ueberschreiben) — als CLEANUP-Job an Core 0
-      MqttOpJob op{}; op.kind = MQOP_CLEANUP; op.idx = idx;
+      MqttOpJob op{}; op.kind = MQOP_CLEANUP;   // [D3] idx ist bei CLEANUP bedeutungslos
       safeStrcpy(op.name, sizeof(op.name), sanitizeName(String(f.name)));
-      if (!mqttOpPost(op)) LOGW("MQTT", "op-queue voll (rename-cleanup)");
+      if (!mqttOpPost(op)) LOGW("MQTT", "MQTT-Auftragspuffer voll (Umbenennen, Aufraeumen)");
     }
     fansLock(); safeStrcpy(f.name, sizeof(f.name), String(j.name)); fansUnlock();   // §19
     // §A1: RESYNC NACH dem CLEANUP (FIFO erhaelt die Reihenfolge) -> Core 0 subscribed/publisht den NEUEN Namen
     MqttOpJob rs{}; rs.kind = MQOP_RESYNC; rs.idx = idx;
-    if (!mqttOpPost(rs)) LOGW("MQTT", "op-queue voll (rename-resync)");
-    Preferences p; p.begin("fans", false);
-    p.putString((String("f") + idx + "_name").c_str(), f.name);
-    p.end();
+    if (!mqttOpPost(rs)) LOGW("MQTT", "MQTT-Auftragspuffer voll (Umbenennen, Neuanmeldung)");
+    Preferences p;
+    if (nvsOpen(p, "fans", false)) {
+      char k[16]; snprintf(k, sizeof(k), "f%u_name", (unsigned)idx);
+      p.putString(k, f.name);
+      p.end();
+    }
     g_stateRev.fetch_add(1);
   }
 
@@ -1013,9 +988,12 @@ static void applyDo(ApplyJob &j) {
       ledcAttach(f.pwmPin, PWM_FREQ_HZ, PWM_BITS);
       ledcWrite(f.pwmPin, f.invertPwm ? (255 - f.duty) : f.duty);
     }
-    Preferences p; p.begin("fans", false);
-    p.putUChar((String("f") + idx + "_inv").c_str(), f.invertPwm ? 1 : 0);
-    p.end();
+    Preferences p;
+    if (nvsOpen(p, "fans", false)) {
+      char k[16]; snprintf(k, sizeof(k), "f%u_inv", (unsigned)idx);
+      p.putUChar(k, f.invertPwm ? 1 : 0);
+      p.end();
+    }
     g_stateRev.fetch_add(1);
   }
 
@@ -1038,11 +1016,15 @@ static void applyDo(ApplyJob &j) {
     rebuildPcntMap();
     f.measureSuspended = false;
 
-    Preferences p; p.begin("fans", false);
-    String k = "f" + String(idx) + "_";
-    p.putUChar((k + "pwm").c_str(), f.pwmPin);
-    p.putUChar((k + "tac").c_str(), f.tachPin);
-    p.end();
+    Preferences p;
+    if (nvsOpen(p, "fans", false)) {
+      char kp[16], kt[16];
+      snprintf(kp, sizeof(kp), "f%u_pwm", (unsigned)idx);
+      snprintf(kt, sizeof(kt), "f%u_tac", (unsigned)idx);
+      p.putUChar(kp, f.pwmPin);
+      p.putUChar(kt, f.tachPin);
+      p.end();
+    }
     g_stateRev.fetch_add(1);
   }
 
@@ -1052,50 +1034,42 @@ static void applyDo(ApplyJob &j) {
     fans[idx].calMinStart = j.calMin;
     safeStrcpy(fans[idx].calNote, sizeof(fans[idx].calNote), String(j.calNote));
     fansUnlock();
-    Preferences p; p.begin("fans", false);
-    String k = "f" + String(idx) + "_";
-    p.putUChar((k + "cmin").c_str(), j.calMin);
-    p.putString((k + "cnote").c_str(), j.calNote);
-    p.end();
+    Preferences p;
+    if (nvsOpen(p, "fans", false)) {
+      char kc[16], kn[16];
+      snprintf(kc, sizeof(kc), "f%u_cmin",  (unsigned)idx);
+      snprintf(kn, sizeof(kn), "f%u_cnote", (unsigned)idx);
+      p.putUChar(kc, j.calMin);
+      p.putString(kn, j.calNote);
+      p.end();
+    }
     g_stateRev.fetch_add(1);
   }
 
-  LOGI("APPLY", String("done idx=") + idx);
+  LOGI("APPLY", String("Aenderung an Luefter ") + idx + " ausgefuehrt");
 }
 
 // ==== HTTP Basics ====
-static void httpSendHeaderOK(NetworkClient &c, const char *ctype) {
-  c.println(F("HTTP/1.1 200 OK"));
+// §C2: EIN Header-Sender statt fuenf fast gleicher Bloecke. Statuszeile + Standard-Header;
+// den Rumpf schreibt der Aufrufer (er wird teils gestreamt/chunked).
+static void httpBegin(NetworkClient &c, int code, const char *reason, const char *ctype) {
+  c.print(F("HTTP/1.1 ")); c.print(code); c.print(' '); c.println(reason);
   c.print(F("Content-Type: ")); c.println(ctype);
   c.println(F("Cache-Control: no-cache, no-store, must-revalidate"));
   c.println(F("Pragma: no-cache"));
   c.println(F("Connection: close"));
   c.println();
 }
-static void httpSend400(NetworkClient &c, const char *msg) {
-  c.println(F("HTTP/1.1 400 Bad Request"));
-  c.println(F("Content-Type: text/plain; charset=UTF-8"));
-  c.println(F("Connection: close"));
-  c.println(); c.println(msg);
+// Vollstaendige Textantwort in einem Zug.
+static void httpText(NetworkClient &c, int code, const char *reason, const char *msg) {
+  httpBegin(c, code, reason, "text/plain; charset=UTF-8");
+  c.println(msg);
 }
-static void httpSend403(NetworkClient &c, const char *msg) {   // §SEC-1
-  c.println(F("HTTP/1.1 403 Forbidden"));
-  c.println(F("Content-Type: text/plain; charset=UTF-8"));
-  c.println(F("Connection: close"));
-  c.println(); c.println(msg);
-}
-static void httpSend500(NetworkClient &c, const char *msg) {
-  c.println(F("HTTP/1.1 500 Internal Server Error"));
-  c.println(F("Content-Type: text/plain; charset=UTF-8"));
-  c.println(F("Connection: close"));
-  c.println(); c.println(msg);
-}
-static void httpSend404(NetworkClient &c) {
-  c.println(F("HTTP/1.1 404 Not Found"));
-  c.println(F("Content-Type: text/plain; charset=UTF-8"));
-  c.println(F("Connection: close"));
-  c.println(); c.println(F("Not found"));
-}
+static void httpSendHeaderOK(NetworkClient &c, const char *ctype) { httpBegin(c, 200, "OK", ctype); }
+static void httpSend400(NetworkClient &c, const char *msg) { httpText(c, 400, "Bad Request", msg); }
+static void httpSend403(NetworkClient &c, const char *msg) { httpText(c, 403, "Forbidden", msg); }   // §SEC-1
+static void httpSend500(NetworkClient &c, const char *msg) { httpText(c, 500, "Internal Server Error", msg); }
+static void httpSend404(NetworkClient &c)                  { httpText(c, 404, "Not Found", "Not found"); }
 // ==== UI-Asset (gzip im Flash, chunked) ====
 static void sendUiAsset(NetworkClient &c) {
   c.println(F("HTTP/1.1 200 OK"));
@@ -1105,13 +1079,7 @@ static void sendUiAsset(NetworkClient &c) {
   c.println(F("Cache-Control: no-cache"));
   c.println(F("Connection: close"));
   c.println();
-  size_t off = 0;
-  while (off < UI_ASSET_LEN) {
-    size_t n = (UI_ASSET_LEN - off) < 1024 ? (UI_ASSET_LEN - off) : 1024;
-    if (c.write(UI_ASSET + off, n) == 0) return;
-    off += n;
-    feedWdt();
-  }
+  writeChunked(c, UI_ASSET, UI_ASSET_LEN);   // §C4: dieselbe Schleife wie printChunked
 }
 
 // ==== JSON-API-Antwort-Helfer ====
@@ -1119,12 +1087,21 @@ static void apiOk(NetworkClient &c) {
   httpSendHeaderOK(c, "application/json; charset=UTF-8");
   c.print(F("{\"ok\":true}"));
 }
-static void apiErr(NetworkClient &c, const char *msg) {  // nur statische msg!
-  c.println(F("HTTP/1.1 400 Bad Request"));
-  c.println(F("Content-Type: application/json; charset=UTF-8"));
-  c.println(F("Connection: close"));
-  c.println();
+// §B5/§C3: JSON-Fehlerantwort mit ECHTEM Statuscode. Vorher gingen alle OTA-Fehler mit
+// "200 OK" raus und trugen den Fehler nur im Rumpf — `curl -f` (so prueft tools/release.sh)
+// sah 200 und meldete Erfolg, obwohl das Geraet das Abbild abgelehnt hatte.
+static void apiFail(NetworkClient &c, int code, const char *reason, const char *msg) {  // nur statische msg!
+  httpBegin(c, code, reason, "application/json; charset=UTF-8");
   c.print(F("{\"ok\":false,\"error\":\"")); c.print(msg); c.print(F("\"}"));
+}
+static void apiErr(NetworkClient &c, const char *msg) { apiFail(c, 400, "Bad Request", msg); }
+// Wie apiFail, aber fuer LAUFZEIT-Texte (z.B. Update.errorString()): der Text wird escaped,
+// statt roh in den JSON-Rumpf konkateniert zu werden.
+static void apiFailEsc(NetworkClient &c, int code, const char *reason, const char *msg) {
+  httpBegin(c, code, reason, "application/json; charset=UTF-8");
+  c.print(F("{\"ok\":false,\"error\":"));
+  jsonPrintEscaped(c, msg);
+  c.print(F("}"));
 }
 
 // Gesamtbudget des aktuellen Nicht-OTA-Requests (Spec §3.1). In handleClient gesetzt.
@@ -1226,16 +1203,19 @@ static bool handleFormPost(NetworkClient &c, size_t contentLength, const String 
 
 // NetworkClient::write() kappt still bei Socket-Puffergroesse (4KB) und meldet
 // trotzdem Erfolg -> NIE mehr als 1KB pro write() schicken (CLAUDE.md §6.11).
-static void printChunked(NetworkClient &c, const char *s, size_t len) {
+static void writeChunked(NetworkClient &c, const uint8_t *d, size_t len) {
   while (len > 0) {
     size_t n = len < 1024 ? len : 1024;
-    if (c.write((const uint8_t *)s, n) == 0) return;
-    s += n; len -= n;
+    if (c.write(d, n) == 0) return;
+    d += n; len -= n;
     feedWdt();
   }
 }
+static inline void printChunked(NetworkClient &c, const char *s, size_t len) {
+  writeChunked(c, (const uint8_t *)s, len);
+}
 
-static void handleLogTxt(NetworkClient &c)     { httpSendHeaderOK(c, "text/plain; charset=UTF-8"); logLock(); String snap = gLogBuf; logUnlock(); printChunked(c, snap.c_str(), snap.length()); }
+static void handleLogTxt(NetworkClient &c)     { httpSendHeaderOK(c, "text/plain; charset=UTF-8"); size_t n = logSnapshot(); printChunked(c, gLogSnap, n); }
 static void handlePrevLogTxt(NetworkClient &c)  { httpSendHeaderOK(c, "text/plain; charset=UTF-8"); printChunked(c, gPrevLogTail.c_str(), gPrevLogTail.length()); }
 
 // ==== JSON Status ====
@@ -1326,7 +1306,7 @@ static void sendJsonStatus(NetworkClient &c) {
 static void commitIfPending() {
   if (g_otaPendingVerify.exchange(false)) {   // idempotent: Doppelaufruf ungefaehrlich
     esp_ota_mark_app_valid_cancel_rollback();
-    LOGI("OTA", "Image als VALID markiert (bewusster Reboot/OTA aus laufendem Image)");
+    LOGI("OTA", "Abbild als gueltig markiert (bewusster Neustart aus laufendem Abbild)");
   }
 }
 
@@ -1348,21 +1328,18 @@ static bool handleOTA(NetworkClient &c, size_t contentLength) {
   // noch PENDING_VERIFY-Zustand (unklare Rollback-Ecke beim OTA INNERHALB des Health-Windows).
   commitIfPending();
   if (contentLength == 0) {
-    httpSendHeaderOK(c, "application/json; charset=UTF-8");
-    c.print(F("{\"ok\":false,\"error\":\"No Content or chunked unsupported\"}"));
-    LOGE("OTA", "no content/chunked");
+    apiFail(c, 400, "Bad Request", "No Content or chunked unsupported");
+    LOGE("OTA", "kein Rumpf / chunked nicht unterstuetzt");
     return false;
   }
   if (contentLength > 0x200000) {  // > 2 MB passt in keinen App-Slot
-    httpSendHeaderOK(c, "application/json; charset=UTF-8");
-    c.print(F("{\"ok\":false,\"error\":\"too large\"}"));
-    LOGE("OTA", "too large");
+    apiFail(c, 413, "Payload Too Large", "too large");
+    LOGE("OTA", "Abbild zu gross");
     return false;
   }
   if (!Update.begin(contentLength)) {
-    httpSendHeaderOK(c, "application/json; charset=UTF-8");
-    c.print(String("{\"ok\":false,\"error\":\"Update.begin failed: ") + Update.errorString() + "\"}");
-    LOGE("OTA", "begin failed");
+    apiFailEsc(c, 500, "Internal Server Error", Update.errorString());
+    LOGE("OTA", String("Update.begin fehlgeschlagen: ") + Update.errorString());
     return false;
   }
   const size_t BUFSZ = 1024;
@@ -1371,7 +1348,7 @@ static bool handleOTA(NetworkClient &c, size_t contentLength) {
   unsigned long t0 = millis();
   const unsigned long ota_start = t0;   // §SEC-3: absolutes Gesamtbudget (t0 wird pro Byte-Fortschritt zurueckgesetzt)
   int lastPct = -1;
-  LOGI("OTA", String("start, size=") + contentLength + " bytes");
+  LOGI("OTA", String("Uebertragung beginnt, ") + contentLength + " Byte");
   while (received < contentLength && !elapsed(millis(), t0, BODY_RD_TIMEOUT)
          && !elapsed(millis(), ota_start, OTA_TIMEOUT_TOTAL_MS)) {
     int n = c.read(buf, min((int)BUFSZ, (int)(contentLength - received)));
@@ -1379,31 +1356,28 @@ static bool handleOTA(NetworkClient &c, size_t contentLength) {
       feedWdt();
       size_t w = Update.write(buf, n);
       if (w != (size_t)n) {
-        httpSendHeaderOK(c, "application/json; charset=UTF-8");
-        c.print(F("{\"ok\":false,\"error\":\"Write error\"}"));
+        apiFail(c, 500, "Internal Server Error", "Write error");
         Update.abort();
-        LOGE("OTA", "write error");
+        LOGE("OTA", "Schreibfehler beim Abbild");
         return false;
       }
       received += n; t0 = millis();
       int pct = (int)((received * 100UL) / contentLength);
-      if (pct != lastPct && (pct % 5 == 0 || pct >= 99)) { LOGI("OTA", String("progress ") + pct + "%"); lastPct = pct; }
+      if (pct != lastPct && (pct % 5 == 0 || pct >= 99)) { LOGI("OTA", String("Fortschritt ") + pct + "%"); lastPct = pct; }
     } else { feedWdt(); delay(1); }
   }
   if (received != contentLength) {
-    httpSendHeaderOK(c, "application/json; charset=UTF-8");
-    c.print(F("{\"ok\":false,\"error\":\"Timeout or size mismatch\"}"));
+    apiFail(c, 400, "Bad Request", "Timeout or size mismatch");
     Update.abort();
-    LOGE("OTA", "timeout/size mismatch");
+    LOGE("OTA", "Zeitueberschreitung oder Groesse passt nicht");
     return false;
   }
   if (!Update.end()) {
-    httpSendHeaderOK(c, "application/json; charset=UTF-8");
-    c.print(String("{\"ok\":false,\"error\":\"Update.end failed: ") + Update.errorString() + "\"}");
-    LOGE("OTA", "end failed");
+    apiFailEsc(c, 500, "Internal Server Error", Update.errorString());
+    LOGE("OTA", String("Update.end fehlgeschlagen: ") + Update.errorString());
     return false;
   }
-  LOGI("OTA", "OK -> reboot");
+  LOGI("OTA", "Abbild angenommen -> Neustart");
   httpSendHeaderOK(c, "application/json; charset=UTF-8");
   c.print(F("{\"ok\":true,\"message\":\"Firmware erfolgreich aktualisiert\",\"reboot\":true,\"reboot_in\":5}"));
   c.flush(); prepareRestart(); delay(300); ESP.restart();
@@ -1429,9 +1403,7 @@ static void apiFanSave(NetworkClient &c, const String &body) {
   // §4.3: alle Namen EINMAL unter Lock snapshotten — applyDo (Control-Core) schreibt fans[].name
   // parallel; sanitizeName liest das ganze Array (Multi-Byte) -> sonst torn read nach dem Split.
   char names[MAX_FANS][20];
-  fansLock();
-  for (uint8_t i = 0; i < MAX_FANS; i++) { uint8_t n = 0; for (; n < 19 && fans[i].name[n]; n++) names[i][n] = fans[i].name[n]; names[i][n] = 0; }
-  fansUnlock();
+  for (uint8_t i = 0; i < MAX_FANS; i++) fanNameSnapshot(i, names[i], sizeof(names[i]));   // §C1
   bool isNew = (idx < 0);   // idx<0 => neuer Luefter: ersten freien Slot ERST HIER belegen (kein Phantom-Slot beim Klick)
   if (isNew) {
     idx = -1;
@@ -1467,7 +1439,9 @@ static void apiFanSave(NetworkClient &c, const String &body) {
   if (isNew || sanitizeName(String(names[idx])) != cleanName) { safeStrcpy(j.name, sizeof(j.name), cleanName); j.nameChanged = true; }
   if (inv != f.invertPwm) { j.invert = inv; j.invChanged = true; }
   if (newPwm != f.pwmPin || newTac != f.tachPin) { j.pwmPin = newPwm; j.tachPin = newTac; j.pinsChanged = true; }
-  if (j.nameChanged || j.invChanged || j.pinsChanged) applyQueue((uint8_t)idx, j);
+  if (j.nameChanged || j.invChanged || j.pinsChanged) {
+    if (!applyQueue((uint8_t)idx, j)) { apiErr(c, "Auftrags-Puffer voll, bitte erneut versuchen"); return; }
+  }
   apiOk(c);
 }
 
@@ -1478,7 +1452,7 @@ static void apiFanDelete(NetworkClient &c, const String &body) {
   // Jeder BELEGTE Slot (Name gesetzt) ist loeschbar — auch unkonfiguriert (ohne Pins).
   if (idx < 0 || idx >= MAX_FANS || fans[idx].name[0] == 0) { apiErr(c, "bad idx"); return; }
   ApplyJob j; j.idx = (uint8_t)idx; j.deleteFan = true;
-  applyQueue((uint8_t)idx, j);
+  if (!applyQueue((uint8_t)idx, j)) { apiErr(c, "Auftrags-Puffer voll, bitte erneut versuchen"); return; }
   apiOk(c);
 }
 
@@ -1495,7 +1469,7 @@ static void apiCalib(NetworkClient &c, const String &body) {
   fansUnlock();
   if (formGet(body, F("cmin"),  s)) j.calMin = dutyFromPct((uint8_t)constrain(s.toInt(), 0, 100));
   if (formGet(body, F("cnote"), s)) safeStrcpy(j.calNote, sizeof(j.calNote), s);
-  applyQueue((uint8_t)idx, j);
+  if (!applyQueue((uint8_t)idx, j)) { apiErr(c, "Auftrags-Puffer voll, bitte erneut versuchen"); return; }
   apiOk(c);
 }
 
@@ -1525,11 +1499,20 @@ static void apiMqttSave(NetworkClient &c, const String &body) {
               || strcmp(old.user,   mqttConfig.user)   != 0
               || strcmp(old.prefix, mqttConfig.prefix) != 0
               || mqttPassChanged(passProvided, old.pass, mqttConfig.pass);
-  if (!changed) { LOGI("MQTT", "config unveraendert -> kein Reboot"); apiOk(c); return; }   // §F5
+  if (!changed) { LOGI("MQTT", "Konfiguration unveraendert — kein Neustart"); apiOk(c); return; }   // §F5
 
-  if (old.haDisc && !mqttConfig.haDisc)   // §5.5: HA gerade ausgeschaltet -> Entitaeten einmalig entfernen (sonst Geister)
-    for (uint8_t i = 0; i < MAX_FANS; i++) haDiscoveryFan(i, false);
-  Preferences p; p.begin("mqtt", false);
+  // §5.5/§B4: HA gerade ausgeschaltet -> Entitaeten einmalig entfernen (sonst Geister).
+  // Das sind bis zu zwei retained QoS-1-Publishes je Luefter. Frueher folgte darauf sofort
+  // ein delay(200) und der Neustart — ohne auf PUBACK zu warten, sodass genau die Geister
+  // stehen blieben, die der Pfad beseitigen soll. Jetzt: Sendezeit proportional zur Anzahl,
+  // gedeckelt, mit Watchdog-Fuetterung.
+  uint8_t haCleared = 0;
+  if (old.haDisc && !mqttConfig.haDisc) {
+    for (uint8_t i = 0; i < MAX_FANS; i++)
+      if (fanPresentIdx(i)) { haDiscoveryFan(i, false); haCleared++; }
+  }
+  Preferences p;
+  if (!nvsOpen(p, "mqtt", false)) { apiErr(c, "NVS nicht beschreibbar"); return; }
   p.putBool("enabled", mqttConfig.enabled);
   p.putString("host",   mqttConfig.host);
   p.putUShort("port",   mqttConfig.port);
@@ -1538,19 +1521,24 @@ static void apiMqttSave(NetworkClient &c, const String &body) {
   p.putString("prefix", mqttConfig.prefix);
   p.putBool("hadisc", mqttConfig.haDisc);
   p.end();
-  LOGI("MQTT", "config saved -> reboot");
+  LOGI("MQTT", "Konfiguration gespeichert -> Neustart");
   apiOk(c);
   // esp-mqtt wird in setup() konfiguriert (kein sauberes Runtime-Reconfig) -> Neustart
   // übernimmt die neue Konfig. Reboot ist rollback-sicher (Image ist valid).
   c.flush();
   prepareRestart();
-  delay(200);
+  // §B4: den QoS-1-Publishes Zeit zum Zustellen geben (100 ms je geloeschter Entitaet,
+  // gedeckelt auf 1,5 s) — der Watchdog hat 8 s Budget, das bleibt weit darunter.
+  uint32_t wartenMs = 200 + (uint32_t)haCleared * 100;
+  if (wartenMs > 1500) wartenMs = 1500;
+  for (uint32_t w = 0; w < wartenMs; w += 50) { delay(50); feedWdt(); }
   esp_restart();
 }
 
 static void apiSafeModeReset(NetworkClient &c, const String &body) {
   (void)body;
-  Preferences p; p.begin("sys", false);
+  Preferences p;
+  if (!nvsOpen(p, "sys", false)) { apiErr(c, "NVS nicht beschreibbar"); return; }
   p.putUChar("crash_streak", 0);
   p.putUChar("safe_mode", 0);
   p.end();
@@ -1569,14 +1557,10 @@ static void apiReboot(NetworkClient &c, const String &body) {
 // ==== Router ====
 // §SEC-1 CSRF: prueft Origin/Referer gegen den Host. Leerer Origin (curl/native) -> erlaubt
 // (LAN-direkt ist im Threat-Model akzeptiert); fremde Authority (Browser-cross-origin) -> false.
-static bool originIsSelf(const String &originRef, const String &host) {
-  if (originRef.length() == 0) return true;
-  if (host.length() == 0)      return true;   // kein Host-Header -> nicht entscheidbar, nicht blocken
-  int s = originRef.indexOf(F("://"));
-  String auth = (s >= 0) ? originRef.substring(s + 3) : originRef;
-  int slash = auth.indexOf('/');
-  if (slash >= 0) auth = auth.substring(0, slash);   // authority = host[:port]
-  return auth.equalsIgnoreCase(host);
+// §E1: liegt host-getestet in fan_logic.h — inklusive der Faelle, die abgelehnt werden MUESSEN
+// (fremde Authority, Praefix-Trick "geraet.local.boese.example", abweichender Port).
+static inline bool originIsSelf(const String &originRef, const String &host) {
+  return originIsSelf(originRef.c_str(), host.c_str());
 }
 
 static void handleClient(NetworkClient &c) {
@@ -1645,19 +1629,20 @@ static void tachInitAllPresentPullups() {
 
 // [B1] Gespeicherte Duty-Werte aus NVS laden und per Queue anwenden
 static void restoreSavedDuties() {
-  Preferences p; p.begin("state", true);
+  Preferences p;
+  if (!nvsOpen(p, "state", true)) return;
   uint8_t restored = 0;
   for (uint8_t i = 0; i < MAX_FANS; i++) {
     if (!fanPresentIdx(i)) continue;
-    String k = "f" + String(i) + "_duty";
-    uint8_t saved = p.getUChar(k.c_str(), 0);
+    char k[16]; snprintf(k, sizeof(k), "f%u_duty", (unsigned)i);
+    uint8_t saved = p.getUChar(k, 0);
     if (saved > 0) {
       dutyEnqueue(i, saved);
       restored++;
     }
   }
   p.end();
-  if (restored > 0) LOGI("STATE", String("restored ") + restored + " duty values from NVS");
+  if (restored > 0) LOGI("STATE", String(restored) + " gespeicherte Drehzahl-Sollwerte wiederhergestellt");
 }
 
 // §5.3: Netz-Task auf Core 0 — Link-Watch + HTTP + Telemetrie-/Log-Drains.
@@ -1673,14 +1658,13 @@ static void networkTask(void *arg) {
 
     // Netz-Status aus async ETH-Events
     bool ipNow = ethHasIp();
-    if (ipNow && !httpUp.load()) { httpServer.begin(); ethStartMdns(); httpUp.store(true); LOGI("NET", String("IP: ") + ethLocalIp()); }
+    if (ipNow && !httpUp.load()) { httpServer.begin(); ethStartMdns(); httpUp.store(true); LOGI("NET", String("erreichbar unter ") + ethLocalIp()); }
     if (!ipNow && httpUp.load() && !ethLinkUp()) httpUp.store(false);   // Link weg -> Server pausiert
-    ethHasIP = ipNow;
     // Link > 15 s weg -> harter Treiber-Reset (Cooldown 5 s). DHCP-Lease erneuert esp-netif selbst.
     if (!ethLinkUp()) {
       if (g_linkLostSince == 0) g_linkLostSince = now;
       if (elapsed(now, g_linkLostSince, ETH_LINK_LOST_RESET_MS) && elapsed(now, g_lastEthReinit, ETH_REINIT_COOLDOWN_MS)) {
-        LOGW("NET", "link down >15s -> ETH hard reset");
+        LOGW("NET", "Verbindung >15 s weg — Treiber wird hart neu gestartet");
         g_lastEthReinit = now;
         httpUp.store(false);
         ethHardReset();
@@ -1690,7 +1674,7 @@ static void networkTask(void *arg) {
     }
 
     // HTTP
-    if (httpUp.load() && ethHasIP) {
+    if (httpUp.load() && ipNow) {
       NetworkClient c = httpServer.accept();
       if (c) {
         uint32_t t0 = millis();
@@ -1716,9 +1700,15 @@ void setup() {
   // §4: Cross-Core-Queues + fans[]-/Cleanup-Mutex VOR allem anderen anlegen (esp-mqtt-Task
   // startet erst mit loopStart() weiter unten; Log-Queue (spaeter) faengt ab hier alle LOGs).
   concurrencyInit();
-  g_applyQ = xQueueCreate(MAX_FANS, sizeof(ApplyJob));   // hier, da sizeof(ApplyJob) erst im Sketch sichtbar
-  fansMutex = xSemaphoreCreateMutex();
-  logMutex  = xSemaphoreCreateMutex();
+  // §B1: alles statisch — keine dieser Erzeugungen kann fehlschlagen, also gibt es auch keinen
+  // stillen Degradierungspfad mehr (frueher: Handle nullptr -> Locks werden zu No-Ops).
+  {
+    static uint8_t      applyStore[MAX_FANS * sizeof(ApplyJob)];   // sizeof(ApplyJob) erst hier sichtbar
+    static StaticQueue_t applyQCB;
+    g_applyQ = xQueueCreateStatic(MAX_FANS, sizeof(ApplyJob), applyStore, &applyQCB);
+  }
+  fansMutex = xSemaphoreCreateMutexStatic(&fansMutexBuf);
+  logMutex  = xSemaphoreCreateMutexStatic(&logMutexBuf);
 
   // Anti-Brick: Task-WDT bleibt AKTIV und ueberwacht den Loop-Task.
   // 8 s Budget; Panic => Reboot => ggf. Bootloader-Rollback (Spec §3.1/3.2).
@@ -1737,7 +1727,7 @@ void setup() {
     if (esp_ota_get_state_partition(running, &st) == ESP_OK &&
         st == ESP_OTA_IMG_PENDING_VERIFY) {
       g_otaPendingVerify.store(true);
-      LOGW("OTA", "Image PENDING_VERIFY - Health-Window 90s laeuft");
+      LOGW("OTA", "Abbild noch unbestaetigt — 90-s-Bewaehrung laeuft");
     }
   }
 
@@ -1769,7 +1759,7 @@ void setup() {
     // SAFE MODE: feste 70 % Failsafe, kein Restore, MQTT bleibt aus (loop).
     for (uint8_t i = 0; i < MAX_FANS; i++)
       if (fanPresentIdx(i)) dutyEnqueue(i, dutyFromPct(70));
-    LOGW("SAFE", "crash loop erkannt -> Failsafe 70%, MQTT aus");
+    LOGW("SAFE", "Absturz-Schleife erkannt — Notlauf 70 %, MQTT aus");
   } else {
     restoreSavedDuties();  // [B1] (Hardware ist bereits auf 0)
   }
@@ -1779,7 +1769,7 @@ void setup() {
   // setzt g_ethHasIp; httpServer wird in loop() gestartet, sobald die IP da ist.
   feedWdt();
   ethRegisterEvents();   // §F7: Event-Callback EINMALIG, vor dem ersten ethBegin (ethHardReset re-registriert nicht mehr)
-  if (!ethBegin()) LOGE("NET", "ETH.begin failed");
+  if (!ethBegin()) LOGE("NET", "Ethernet-Treiber startet nicht");
   feedWdt();
 
   // [Stufe2/2] esp-mqtt zuletzt starten (Task läuft eigenständig, Auto-Reconnect; onMqttConnect
@@ -1794,17 +1784,25 @@ void setup() {
     mqtt.enableLastWillMessage(g_mqttLwtTopic.c_str(), "offline", true);
     mqtt.setKeepAlive(30);
     mqtt.loopStart();
-    LOGI("MQTT", String("esp-mqtt started (port ") + mqttConfig.port + ")");  // §F11a: Broker-IP nicht ins Log
+    LOGI("MQTT", String("MQTT-Task gestartet (Port ") + mqttConfig.port + ")");  // §F11a: Broker-IP nicht ins Log
   }
 
-  LOGI("BOOT", "Setup complete.");
+  LOGI("BOOT", "Start abgeschlossen.");
   logDrain();   // §4.6: Setup-Log-Burst aus der Queue in gLogBuf flushen (vor Task-Start)
 
   // §5.3: Netz-Task auf Core 0 starten (Control bleibt loopTask/Core 1, anderer Core -> keine
   // Prio-Konkurrenz). Stack 8 KB konservativ (HTTP, kein TLS) -> in Stufe 9 per
   // uxTaskGetStackHighWaterMark pruefen. Prio 5 = wie der esp-mqtt-Task (beide auf Core 0; net
   // yieldet per delay(2), daher keine MQTT-Starvation).
-  xTaskCreatePinnedToCore(networkTask, "net", 8192, nullptr, 5, &g_netTaskHandle, 0);
+  // §B1: Rueckgabe pruefen. Scheitert der Task, hat das Geraet KEIN HTTP und kein MQTT —
+  // dann ist ein sofortiger Neustart richtig: er faellt (bei frischem OTA) ueber das
+  // Health-Window in den Bootloader-Rollback, statt unerreichbar weiterzulaufen.
+  if (xTaskCreatePinnedToCore(networkTask, "net", 8192, nullptr, 5, &g_netTaskHandle, 0) != pdPASS) {
+    LOGE("BOOT", "Netz-Task laesst sich nicht starten -> Neustart");
+    persistLogTail();
+    delay(100);
+    esp_restart();
+  }
 }
 
 // ==== loop() ====
@@ -1829,18 +1827,25 @@ void loop() {
       lastNetCtr = nc; lastNetChkMs = now;
     }
     bool reachable = ethHasIp() && httpUp.load() && netTicking;
-    if (now > OTA_HEALTH_MS && reachable) {
+    // §F1: elapsed(now, 0, X) statt `now > X` — gleiche Bedeutung, aber wrap-sicher und
+    // konsistent mit der Projektregel („IMMER elapsed(), nie millis() < deadline").
+    if (elapsed(now, 0, OTA_HEALTH_MS) && reachable) {
       commitIfPending();
-    } else if (now > 120000UL && !reachable) {
-      LOGE("OTA", "nicht erreichbar (IP+HTTP+net-heartbeat) in 120s -> Selbst-Neustart, Rollback aufs vorherige Image");
+    } else if (elapsed(now, 0, 120000UL) && !reachable) {
+      LOGE("OTA", "120 s nicht erreichbar (IP, HTTP, Netz-Herzschlag) — Neustart, Ruecksprung auf das vorherige Abbild");
       persistLogTail();
       delay(100);
       esp_restart();   // ohne commit -> PENDING_VERIFY bleibt -> Bootloader-Rollback
     }
   }
 
-  uint32_t hf = ESP.getFreeHeap();
-  if (hf < g_minFreeHeap.load()) g_minFreeHeap.store(hf);
+  // §A4: ESP.getFreeHeap() iteriert die Heap-Regionen — im Sekundentakt statt ~400x/s.
+  static uint32_t lastHeapCheck = 0;
+  if (elapsed(now, lastHeapCheck, 1000)) {
+    lastHeapCheck = now;
+    uint32_t hf = ESP.getFreeHeap();
+    if (hf < g_minFreeHeap.load()) g_minFreeHeap.store(hf);
+  }
 
   // --- Apply-Queue ---
   { ApplyJob j;
@@ -1863,7 +1868,13 @@ void loop() {
     if (fanPresentIdx(i) && fans[i].burstLeft > 0) { anyBurst = true; break; }
   uint32_t interval = anyBurst ? RPM_BURST_INTERVAL_MS : RPM_BASE_INTERVAL_MS;
 
-  if (now - lastMeasureTick >= interval) {
+  if (elapsed(now, lastMeasureTick, interval)) {          // §F1: elapsed() statt roher Subtraktion
+    // §G: die TATSAECHLICH vergangene Zeit merken. Vorher rechnete die RPM-Formel mit dem
+    // nominalen Intervall, obwohl die echte Spanne immer >= interval ist (lastMeasureTick = now,
+    // nicht += interval). Der Fehler ging systematisch nach oben und wurde spuerbar, wenn ein
+    // applyDo mit seinem delay(50) plus NVS-Schreiben in ein 500-ms-Fenster fiel.
+    uint32_t spanMs = now - lastMeasureTick;
+    if (spanMs == 0) spanMs = interval;                    // Division schuetzen
     lastMeasureTick = now;
 
     for (uint8_t i = 0; i < MAX_FANS; i++) {
@@ -1910,17 +1921,16 @@ void loop() {
       if (f.duty == 0 || f.measureSuspended) {
         rpmSample = 0;
       } else {
-        uint32_t rpm = (pulsesDelta * (60000UL / interval)) / max<uint8_t>(1, PULSES_PER_REV);
+        uint32_t rpm = rpmFromPulses(pulsesDelta, spanMs, PULSES_PER_REV);   // §E1/§G: host-getestet
         if (rpm > RPM_HARD_CAP) rpm = RPM_HARD_CAP;
         rpmSample = (uint16_t)rpm;
       }
 
-      // Median-of-3
+      // Median-of-3 (§E1: median3() liegt host-getestet in fan_logic.h)
       f.rpmRawA = f.rpmRawB;
       f.rpmRawB = f.rpmRawC;
       f.rpmRawC = rpmSample;
-      uint16_t a = f.rpmRawA, b = f.rpmRawB, cc = f.rpmRawC;
-      uint16_t med = max<uint16_t>(min<uint16_t>(a, b), min<uint16_t>(max<uint16_t>(a, b), cc));
+      uint16_t med = median3(f.rpmRawA, f.rpmRawB, f.rpmRawC);
 
       // EMA
       if (f.rpmEma <= 0.01f) f.rpmEma = (float)med;
@@ -1938,7 +1948,7 @@ void loop() {
 
   // --- Log-Tail persistieren ---
   static uint32_t lastLogFlush = 0;
-  if (now - lastLogFlush >= LOG_FLUSH_MS) {
+  if (elapsed(now, lastLogFlush, LOG_FLUSH_MS)) {          // §F1
     lastLogFlush = now;
     persistLogTail();
   }

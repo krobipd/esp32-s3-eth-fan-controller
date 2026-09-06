@@ -28,6 +28,17 @@ jobs:
       - name: Install libraries
         run: arduino-cli lib install ESP32MQTTClient@1.1.3
 
+      # Testkette VOR dem Compile: Host-Tests (3 Compiler, -Werror + ASan/UBSan),
+      # Syntax des inline-JavaScripts, der Python-Werkzeuge und der Shell-Skripte,
+      # sowie der Abgleich ui_asset.h <-> ui/index.html.
+      # Ohne diesen Schritt kompilierte die CI nur — ein JS-Syntaxfehler wäre bis
+      # auf das Gerät durchgelaufen (der Compiler sieht nur das gzip-Byte-Array).
+      - name: Test suite (host tests + web/tool syntax)
+        run: bash tools/run_tests.sh
+
+      - name: Behaviour tests against the mock
+        run: bash tools/test_mock.sh
+
       - name: Generate UI asset (ui/index.html -> ui_asset.h)
         run: sh tools/build_ui.sh
 

@@ -39,7 +39,7 @@ und werden im Hauptloop abgearbeitet (entkoppelt von der Hardware).
   "core1_loops": 1234567,
   "net_loops": 1234890,
   "net_stack_hwm": 4304,
-  "mqtt": { "enabled": true, "host": "10.0.0.5", "port": 1883, "user": "iob", "prefix": "esp" },
+  "mqtt": { "enabled": true, "host": "10.0.0.5", "port": 1883, "user": "iob", "prefix": "esp", "hadisc": false },
   "free_pwm":  [1,2,8,15,16,17,33,34,39,48],
   "free_tach": [1,2,8,15,16,17,33,34,39,48],
   "fans": [
@@ -56,6 +56,10 @@ und werden im Hauptloop abgearbeitet (entkoppelt von der Hardware).
 - `pwm` = roher 8-bit-Duty (0–255), `pct` = davon abgeleitete Prozent (0–100).
 - `present` = vollständig konfiguriert (Name + beide Pins). Unkonfigurierte, aber angelegte
   Slots erscheinen mit `present:false` (zum Bearbeiten).
+- `hadisc` = Home-Assistant-Auto-Discovery (Standard aus).
+- `rev` = Revisionszähler, steigt bei **Strukturänderungen** (Lüfter angelegt, umbenannt,
+  gelöscht, Pins/Kalibrierung geändert) — nicht bei bloßen Drehzahländerungen. Clients
+  können damit erkennen, ob sie ihre Ansicht neu aufbauen müssen.
 - Das MQTT-**Passwort** wird nie ausgegeben.
 - `free_pwm`/`free_tach` = aktuell freie, geeignete GPIOs (für die Pin-Auswahl im UI).
 
