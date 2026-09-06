@@ -12,8 +12,12 @@ docs/superpowers/
 *.pdf
 *.jpg
 
-# Arduino-Build-Artefakte (werden lokal/CI erzeugt)
+# Arduino-Build-Artefakte (werden lokal/CI erzeugt).
+# dist/ als GANZES, nicht nur nach Endung: --output-dir legt dort alles ab, was die Toolchain
+# erzeugt, und eine Endungsliste laesst jede neue Artefaktart durch (eine SHA256SUMS.txt tat
+# das prompt). Fertige Abbilder haengen an den GitHub-Releases, nicht im Repo.
 build/
+dist/
 *.map
 *.elf
 *.bin
