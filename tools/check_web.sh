@@ -42,24 +42,30 @@ bash -n tools/run_tests.sh  || { echo "SYNTAXFEHLER: tools/run_tests.sh"; rc=1; 
 
 # --- ui_asset.h muss zu ui/index.html passen ---
 # Sonst laeuft die geflashte Oberflaeche der Quelle hinterher, ohne dass es auffaellt.
-# Wichtig: gegen einen FRISCHEN Build vergleichen, nicht gegen den git-Stand -- eine
-# legitime, noch nicht committete UI-Aenderung ist kein Fehler. Und niemals `git checkout`
-# im Pruefpfad: ein Test darf den Arbeitsbaum nicht anfassen.
-gzip -9 -n -c ui/index.html > "$TMP/ui.gz"
-{
-    echo "// GENERIERT von tools/build_ui.sh - nicht von Hand editieren"
-    echo "#pragma once"
-    echo "#include <pgmspace.h>"
-    echo "static const uint8_t UI_ASSET[] PROGMEM = {"
-    xxd -i < "$TMP/ui.gz"
-    echo "};"
-    echo "static const unsigned int UI_ASSET_LEN = sizeof(UI_ASSET);"
-} > "$TMP/ui_asset_erwartet.h"
-if ! cmp -s "$TMP/ui_asset_erwartet.h" fan_controller/ui_asset.h; then
-    echo "FEHLER: fan_controller/ui_asset.h passt nicht zu ui/index.html."
-    echo "        'sh tools/build_ui.sh' ausfuehren und das Ergebnis mit committen."
-    rc=1
-fi
+#
+# WICHTIG: den INHALT vergleichen, nicht die komprimierten Bytes. gzip erzeugt auf
+# verschiedenen Plattformen und Versionen unterschiedliche Ausgabe (macOS != Linux-Runner) --
+# ein Byte-Vergleich waere lokal gruen und in der CI rot, ohne dass irgendetwas falsch ist.
+# Deshalb: das Byte-Array aus dem Header zurueck-entpacken und mit der Quelle vergleichen.
+python3 - "$TMP" <<'PYEOF' || rc=1
+import gzip, re, sys
+
+with open("fan_controller/ui_asset.h", encoding="utf-8") as f:
+    header = f.read()
+roh = bytes(int(x, 16) for x in re.findall(r"0x([0-9a-fA-F]{2})", header))
+if not roh:
+    sys.exit("FEHLER: ui_asset.h enthaelt kein Byte-Array -- Generierung kaputt?")
+try:
+    entpackt = gzip.decompress(roh).decode("utf-8")
+except Exception as e:
+    sys.exit("FEHLER: ui_asset.h laesst sich nicht entpacken (%s)" % e)
+with open("ui/index.html", encoding="utf-8") as f:
+    quelle = f.read()
+if entpackt != quelle:
+    sys.exit("FEHLER: fan_controller/ui_asset.h passt inhaltlich nicht zu ui/index.html.\n"
+             "        'sh tools/build_ui.sh' ausfuehren und das Ergebnis mit committen.\n"
+             "        (%d Byte im Header vs. %d Byte in der Quelle)" % (len(entpackt), len(quelle)))
+PYEOF
 
 [ "$rc" -eq 0 ] && echo "Oberflaeche/Werkzeuge: Syntax OK (inline-JS + 2 Python + 4 Shell + ui_asset.h aktuell)"
 exit "$rc"
