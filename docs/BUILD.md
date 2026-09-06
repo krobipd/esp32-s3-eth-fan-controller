@@ -71,14 +71,28 @@ Alternativ über die Web-UI: Tab **Firmware** → `.bin` auswählen → Upload &
 >   sich vorher selbst gültig.
 > - Ein fehlgeschlagener *Upload* kann nicht bricken: die alte App läuft bis zum Reboot weiter.
 
-## Schritt 4 — Logik-Tests (optional, ohne Hardware)
+## Schritt 4 — Testkette (ohne Hardware, Pflicht vor jedem Release)
 
-Die wrap-sichere Zeitarithmetik, das %↔Duty-Mapping und die Namensvalidierung sind als
-Host-Unittests ausgelagert:
+Die komplette gerätelose Prüfung läuft über **einen** Befehl — dieselbe Kette fährt die CI
+bei jedem Push und Pull-Request:
 
 ```sh
-c++ -std=c++17 tests/host/test_logic.cpp -o /tmp/t && /tmp/t   # -> OK
+bash tools/run_tests.sh     # Host-Tests + Syntax der Oberfläche und der Werkzeuge
+bash tools/test_mock.sh     # Verhaltenstests gegen den Geräteersatz
 ```
+
+Was dabei geprüft wird:
+
+| Prüfung | Warum |
+|---|---|
+| Host-Tests mit **jedem** gefundenen Compiler, `-Wall -Wextra -Werror`, ASan + UBSan | clang und gcc warnen unterschiedlich; die Logik rechnet mit rohen Puffern und Zeit-Arithmetik über den 32-bit-Wrap |
+| `node --check` auf das inline-JavaScript aus `ui/index.html` | `build_ui.sh` gzippt die Datei zu einem Byte-Array — der Compiler sieht nur noch Zahlen, ein JS-Syntaxfehler übersetzt **fehlerfrei** und würde geflasht |
+| Syntax der Python- und Shell-Werkzeuge | sie laufen sonst erst im Release-Moment das erste Mal |
+| `ui_asset.h` == `ui/index.html` | sonst läuft die geflashte Oberfläche der Quelle hinterher |
+| 63 Verhaltenstests gegen `tools/mock_api.py` | halten fest, dass der Geräteersatz **dieselben** Routen, Prüfungen und Statuscodes hat wie die Firmware |
+
+Die Extraktion des JavaScripts (`tools/extract_ui_js.py`) ist **zeilentreu**: eine Fehlermeldung
+von `node` zeigt auf die Zeile in `ui/index.html`, nicht auf eine Position in einem Extrakt.
 
 ## UI ohne Gerät entwickeln
 
@@ -88,3 +102,8 @@ Oberfläche im Browser ohne ESP getestet werden kann:
 ```sh
 python3 tools/mock_api.py        # -> http://127.0.0.1:8077
 ```
+
+Der Mock ist ein **vollständiger Geräteersatz**: dieselben Routen (und nur die), dieselbe
+Eingabeprüfung, dieselben Fehlertexte und Statuscodes, dieselbe CSRF-Prüfung. Das ist Absicht —
+ein Ersatz, der weniger verlangt als das Original, verschiebt Fehler genau dorthin, wo sie am
+teuersten sind: auf ein Gerät ohne USB-Rückweg. `tools/test_mock.sh` hält das fest.

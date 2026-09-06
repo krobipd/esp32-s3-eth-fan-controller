@@ -4,6 +4,18 @@
 #include "freertos/queue.h"
 
 // ==== Stufe 3: Cross-Core-Kanaele (FreeRTOS-Queues statt volatile-Flags) ====
+//
+// ⚠️ RANDBEDINGUNG — vor jedem Aufteilen des Sketches lesen (§E2):
+// Die Handles unten sind auf DATEIEBENE static definiert. Das ist korrekt, solange der
+// Sketch EINE Uebersetzungseinheit ist (heute der Fall: eine .ino plus Header).
+// Wird der Code je auf mehrere .cpp verteilt, bekommt JEDE Uebersetzungseinheit ihre
+// EIGENE Kopie dieser Handles — die Queues waeren getrennt, und derselbe Fehler trifft
+// die Mutexe im Sketch: `fansMutex` waere in einer Einheit gesetzt und in der anderen
+// nullptr. Da fansLock()/logLock() null-tolerant sind, wuerden die Locks dann STILL zu
+// No-Ops und der gesamte Cross-Core-Schutz verschwaende ohne eine einzige Fehlermeldung.
+// Eine Aufteilung muss diese Definitionen deshalb ZUERST auf "einmal definiert, sonst
+// extern deklariert" umstellen. Wer das ueberspringt, baut genau die Race-Klasse ein,
+// die dieser Code sorgfaeltig vermeidet.
 // Message-Passing ersetzt geteilten Speicher: keine Cross-Core-Barriere noetig, nie blockierend.
 
 // Snapshot eines Luefter-Ereignisses, Core 1 (Control) -> Core 0 (Netz/MQTT).
@@ -14,14 +26,14 @@ struct TelemetrySample {
   uint8_t  kind;   // TelemKind
   uint8_t  duty;   // gueltig bei TELEM_SPEED
   uint16_t rpm;    // gueltig bei TELEM_RPM
-  uint8_t  fault;
+  // [D2] fault entfernt — wurde bei jedem Post gefuellt, aber von telemDrain nie gelesen
 };
 
 // Befehl Core 0 (Netz/MQTT) -> Core 1 (Control): setze Duty fuer idx.
 struct DutyCmd { uint8_t idx; uint8_t duty; };
 
 // §4.6: eine fertig formatierte Log-Zeile, von beiden Cores -> Log-Consumer (haengt an gLogBuf).
-struct LogLine { char text[128]; };
+struct LogLine { char text[160]; };   // §F3: muss LOG_LINE_MAX im Sketch entsprechen
 
 // §A1: MQTT-Operation Core 1 (Control) -> Core 0 (Netz). applyDo darf esp-mqtt NICHT direkt
 // aufrufen (lock-freier Lib-Vector _topicSubscriptionList + synchroner Publish blockiert den
@@ -48,11 +60,22 @@ static QueueHandle_t g_mqttOpQ = nullptr;  // MqttOpJob, Core1 -> Core0 (§A1)
 #define LOG_Q_DEPTH   40   // haelt den Setup-Burst (am Ende von setup() einmal gedrained)
 #define MQTTOP_Q_DEPTH 16  // §A1: Rename = 2 Jobs (CLEANUP+RESYNC) -> >= 2*MAX_FANS
 
+// §B1: STATISCH angelegt statt auf dem Heap. xQueueCreate() kann fehlschlagen, und die
+// Rueckgabe wurde frueher nirgends geprueft -- bei einem Fehlschlag blieb der Handle nullptr
+// und telemPost/dutyPost/logPost wurden zu STILLEN No-Ops: Telemetrie und Logs versiegten
+// wortlos. Mit xQueueCreateStatic() gibt es diesen Fehlerfall gar nicht mehr: der Speicher
+// liegt im .bss, die Erzeugung kann nicht scheitern. Gleiche Menge RAM, nur deterministisch.
+static uint8_t s_telemStore[TELEM_Q_DEPTH  * sizeof(TelemetrySample)];
+static uint8_t s_dutyStore[DUTY_Q_DEPTH    * sizeof(DutyCmd)];
+static uint8_t s_logStore[LOG_Q_DEPTH      * sizeof(LogLine)];
+static uint8_t s_mqttOpStore[MQTTOP_Q_DEPTH * sizeof(MqttOpJob)];
+static StaticQueue_t s_telemQCB, s_dutyQCB, s_logQCB, s_mqttOpQCB;
+
 static inline void concurrencyInit() {
-  g_telemQ  = xQueueCreate(TELEM_Q_DEPTH,  sizeof(TelemetrySample));
-  g_dutyQ   = xQueueCreate(DUTY_Q_DEPTH,   sizeof(DutyCmd));
-  g_logQ    = xQueueCreate(LOG_Q_DEPTH,    sizeof(LogLine));
-  g_mqttOpQ = xQueueCreate(MQTTOP_Q_DEPTH, sizeof(MqttOpJob));
+  g_telemQ  = xQueueCreateStatic(TELEM_Q_DEPTH,  sizeof(TelemetrySample), s_telemStore,  &s_telemQCB);
+  g_dutyQ   = xQueueCreateStatic(DUTY_Q_DEPTH,   sizeof(DutyCmd),         s_dutyStore,   &s_dutyQCB);
+  g_logQ    = xQueueCreateStatic(LOG_Q_DEPTH,    sizeof(LogLine),         s_logStore,    &s_logQCB);
+  g_mqttOpQ = xQueueCreateStatic(MQTTOP_Q_DEPTH, sizeof(MqttOpJob),       s_mqttOpStore, &s_mqttOpQCB);
 }
 // Nicht-blockierend einreihen (Timeout 0): im Fehlerfall lieber droppen als den Core stallen.
 static inline void telemPost(const TelemetrySample &s) { if (g_telemQ) xQueueSend(g_telemQ, &s, 0); }

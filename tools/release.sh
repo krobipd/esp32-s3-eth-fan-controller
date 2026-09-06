@@ -27,8 +27,11 @@ vcode()  { grep -oE '#define FW_VERSION "[0-9]+\.[0-9]+\.[0-9]+"' "$INO" | grep 
 semver() { [[ "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "Version muss x.y.z sein: '$1'"; }
 
 do_build() {
+  # Reihenfolge: UI zuerst erzeugen (die Testkette prueft, ob ui_asset.h dazu passt),
+  # dann die ganze geraetelose Pruefung, erst danach compilieren.
   echo "== UI-Build =="            ; sh tools/build_ui.sh
-  echo "== Host-Tests =="          ; c++ -std=c++17 tests/host/test_logic.cpp -o /tmp/fanctl-test && /tmp/fanctl-test
+  echo "== Testkette =="           ; bash tools/run_tests.sh
+  echo "== Verhaltenstests =="     ; bash tools/test_mock.sh
   echo "== Compile ($FQBN) =="     ; rm -rf "$OUT"; "$CLI" compile --fqbn "$FQBN" --output-dir "$OUT" fan_controller
   echo "OK build — Code-Version $(vcode) — Image $BIN"
 }
@@ -41,7 +44,13 @@ do_prep() {
   sed -i '' -E "s/#define FW_VERSION \"[^\"]+\"/#define FW_VERSION \"$ver\"/" "$INO"
   [[ "$(vcode)" == "$ver" ]] || die "Version-Bump fehlgeschlagen"
   do_build
-  git add -A
+  # Nur die Pfade committen, die zum Release gehoeren -- kein pauschales Hinzufuegen des
+  # ganzen Arbeitsbaums. Das nahm sonst alles mit, was gerade danebenlag, und verliess sich
+  # darauf, dass die Ignorier-Regeln lueckenlos sind. Ein Teil davon liegt in
+  # .git/info/exclude, und die wandert NICHT mit dem Repo: in einem frischen Clone auf einem
+  # anderen Rechner gaebe es diesen Schutz gar nicht.
+  git add fan_controller ui tools tests docs .github README.md LICENSE .gitignore
+  git status --short
   git commit -F "$notes"
   git push -u origin "$br"
   gh pr create --base main --title "v$ver" --body-file "$notes"
@@ -76,8 +85,19 @@ do_flash() {
   [[ -f "$BIN" ]] || die "Kein Image ($BIN) — erst 'build' oder 'prep' laufen lassen"
   [[ "$(vcode)" == "$ver" ]] || echo "WARN: Code-Version $(vcode) ≠ $ver — flashe das gebaute Image $BIN"
   echo "== OTA-Flash v$ver -> $DEVICE =="
-  curl -fsS --max-time 120 -X POST --data-binary @"$BIN" \
-       -H 'Content-Type: application/octet-stream' "http://$DEVICE/ota" || die "OTA-Upload fehlgeschlagen"
+  # Seit v5.5.0 antwortet die Firmware auf abgelehnte Abbilder mit einem ECHTEN Fehlercode
+  # (400/413/500) statt mit "200 OK" -- vorher meldete `curl -f` hier faelschlich Erfolg.
+  # `-f` unterdrueckt allerdings den Antwortrumpf, also Status und Rumpf getrennt einsammeln,
+  # damit der Grund der Ablehnung tatsaechlich im Terminal steht.
+  local rumpf status
+  rumpf="$(curl -sS --max-time 120 -X POST --data-binary @"$BIN" \
+       -H 'Content-Type: application/octet-stream' \
+       -w '\n%{http_code}' "http://$DEVICE/ota")" || die "OTA-Upload: keine Verbindung zum Geraet"
+  status="${rumpf##*$'\n'}"
+  rumpf="${rumpf%$'\n'*}"
+  echo "$rumpf"
+  [[ "$status" == "200" ]] || die "OTA abgelehnt (HTTP $status): $rumpf"
+  echo "$rumpf" | grep -q '"ok":true' || die "OTA nicht bestaetigt: $rumpf"
   echo; echo "Gerät rebootet — warte auf Erreichbarkeit (per IP, mDNS löst langsam auf)..."
   local r=""
   for i in $(seq 1 24); do
@@ -88,7 +108,21 @@ do_flash() {
   [[ -n "$r" ]] || die "Gerät nach Flash nicht erreichbar — Status manuell prüfen (Anti-Brick rollt sonst nach 120s zurück)"
   echo "$r" | python3 -c 'import sys,json;d=json.load(sys.stdin);print("fw_version",d["fw_version"],"| ota_pending",d["ota_pending"],"| crash_streak",d["crash_streak"],"| safe_mode",d["safe_mode"],"| mqtt",d["mqtt_connected"],"| boot_count",d["boot_count"])'
   echo
-  echo ">> Health prüfen: fw_version == $ver, crash_streak 0, safe_mode false, mqtt true."
+  # Die Version MASCHINELL prüfen, nicht dem Auge überlassen: Genau hier lag die alte Falle —
+  # das Skript meldete Erfolg, und ob wirklich die neue Firmware lief, stand nur in einer
+  # Zeile, die jemand lesen musste.
+  echo "$r" | VER="$ver" python3 -c "
+import sys, json, os
+d = json.load(sys.stdin)
+soll = os.environ['VER']
+if d.get('fw_version') != soll:
+    sys.exit('FEHLER: Geraet meldet fw_version %s, erwartet %s — der Flash hat NICHT gegriffen.'
+             % (d.get('fw_version'), soll))
+if d.get('safe_mode'):
+    sys.exit('FEHLER: Geraet ist im Safe-Mode (crash_streak %s).' % d.get('crash_streak'))
+print('Version bestaetigt: v%s laeuft (Boot #%s), MQTT %s.'
+      % (d['fw_version'], d['boot_count'], 'verbunden' if d.get('mqtt_connected') else 'GETRENNT'))
+" || die "Health-Check nach dem Flash fehlgeschlagen"
   echo ">> Nach ~90s Health-Window sollte ota_pending false sein (Commit, kein Rollback) — ggf. /api/status erneut abrufen."
 }
 
