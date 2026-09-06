@@ -221,7 +221,12 @@ static inline void safeStrcpy(char *dst, size_t cap, const String &src) {
 // §E1: Regel liegt host-getestet in fan_logic.h — dieselbe Regel bildet der Mock nach,
 // beide Seiten sind jetzt festgenagelt (Host-Test + tools/test_mock.py).
 static String sanitizeName(const String &in) {
-  char buf[20];
+  // Puffer BEWUSST groesser als die erlaubten 19 Zeichen: Wuerde hier auf 20 gekappt,
+  // kaeme ein 25-Zeichen-Name als gueltige 19er-Version zurueck und fanNameValid()
+  // wuerde ihn AKZEPTIEREN statt abzulehnen. Die Laengenpruefung muss den ungekuerzten
+  // Namen sehen. (Regression aus dem ersten Anlauf dieser Extraktion — jetzt in
+  // tests/host/test_parse.cpp als Kette sanitize->validate festgenagelt.)
+  char buf[64];
   sanitizeNameInto(in.c_str(), buf, sizeof(buf));
   return String(buf);
 }

@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstring>
 #include "../../fan_controller/fan_logic.h"
+#include "../../fan_controller/fw_util.h"
 
 static void pruefeDecode(const char *ein, const char *erwartet) {
   char buf[128];
@@ -121,6 +122,29 @@ int main() {
   assert(!originIsSelf("http://geraet.loca", "geraet.local"));                 // kuerzer
   assert(!originIsSelf("http://geraet.local:8080", "geraet.local"));           // anderer Port
   assert(!originIsSelf("http://geraet.local", "geraet.local:80"));
+
+  // ---------------- Kette sanitize -> validate ----------------
+  // Der eigentliche Ablauf in apiFanSave: erst bereinigen, dann pruefen. Beide Teile
+  // einzeln zu testen genuegt NICHT — genau dazwischen entstand eine Regression: mit einem
+  // 20-Byte-Puffer kam ein 25-Zeichen-Name als gueltige 19er-Version zurueck und wurde
+  // AKZEPTIERT, statt abgelehnt zu werden. Der Puffer muss laenger sein als das Limit,
+  // damit die Laengenpruefung den ungekuerzten Namen sieht.
+  {
+    char buf[64];   // wie im Sketch-Wrapper
+    sanitizeNameInto("abcdefghijklmnopqrstuvwxy", buf, sizeof(buf));   // 25 Zeichen
+    assert(strlen(buf) == 25);
+    assert(!fanNameValid(buf));                        // zu lang -> MUSS abgelehnt werden
+    sanitizeNameInto("Mein Luefter 1", buf, sizeof(buf));
+    assert(strcmp(buf, "mein_luefter_1") == 0 && fanNameValid(buf));
+    sanitizeNameInto("!!!", buf, sizeof(buf));
+    assert(strcmp(buf, "fan") == 0 && fanNameValid(buf));   // Ersatzname ist gueltig
+    sanitizeNameInto("Status", buf, sizeof(buf));
+    assert(strcmp(buf, "status") == 0 && !fanNameValid(buf));   // reserviert
+    sanitizeNameInto("abcdefghijklmnopqrs", buf, sizeof(buf));  // genau 19 -> gerade noch ok
+    assert(strlen(buf) == 19 && fanNameValid(buf));
+    sanitizeNameInto("abcdefghijklmnopqrst", buf, sizeof(buf)); // 20 -> eins zu viel
+    assert(strlen(buf) == 20 && !fanNameValid(buf));
+  }
 
   puts("OK");
   return 0;

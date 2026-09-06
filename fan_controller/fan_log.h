@@ -22,6 +22,11 @@ static const size_t   LOG_NVS_MAX  = 1600;
 // Boot-Zaehler steht im Log-Praefix jeder Zeile.
 static uint32_t g_bootCount = 0;
 
+// Die Queue-Zeile und der Formatpuffer muessen gleich gross sein — sonst wuerden Log-Zeilen
+// beim Einreihen ein zweites Mal still gekappt. Ein Kommentar allein haelt das nicht.
+static_assert(sizeof(((LogLine *)nullptr)->text) == LOG_LINE_MAX,
+              "LogLine::text (concurrency.h) und LOG_LINE_MAX muessen uebereinstimmen");
+
 // Der Ringpuffer selbst. gLogSnap ist der Kopier-Zwischenspeicher: so wird der Lock NIE
 // ueber Socket-I/O oder NVS gehalten (eigene Disziplin, §4.3).
 static char   gLogBuf[LOG_MAX + 1] = {0};
