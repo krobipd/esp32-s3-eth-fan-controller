@@ -20,7 +20,8 @@ FQBN="esp32:esp32:esp32s3:CDCOnBoot=cdc"
 OUT="/tmp/fanctl-release"
 BIN="$OUT/fan_controller.ino.bin"
 DEVICE="${FANCTL_DEVICE:-fan-controller.local}"   # OTA-Ziel; fürs Flashen besser die IP setzen (mDNS löst nach Reboot langsam): FANCTL_DEVICE=10.x.x.x
-CLI="${ARDUINO_CLI:-/Applications/Arduino IDE.app/Contents/Resources/app/lib/backend/resources/arduino-cli}"
+# Reihenfolge: ausdrücklich gesetzt > arduino-cli im PATH > die der Arduino IDE auf macOS.
+CLI="${ARDUINO_CLI:-$(command -v arduino-cli || echo "/Applications/Arduino IDE.app/Contents/Resources/app/lib/backend/resources/arduino-cli")}"
 
 die()    { echo "FEHLER: $*" >&2; exit 1; }
 vcode()  { grep -oE '#define FW_VERSION "[0-9]+\.[0-9]+\.[0-9]+"' "$INO" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+'; }
@@ -41,7 +42,8 @@ do_prep() {
   [[ -f "$notes" ]] || die "Notes-Datei nicht gefunden: $notes"
   local br; br="$(git branch --show-current)"
   [[ "$br" != "main" && -n "$br" ]] || die "Nicht von main releasen — erst Feature-Branch anlegen + Änderungen committen"
-  sed -i '' -E "s/#define FW_VERSION \"[^\"]+\"/#define FW_VERSION \"$ver\"/" "$INO"
+  # Ohne "sed -i": BSD-sed verlangt dort ein Suffix-Argument, GNU-sed hielte es für das Skript.
+  sed -E "s/#define FW_VERSION \"[^\"]+\"/#define FW_VERSION \"$ver\"/" "$INO" > "$INO.tmp" && mv "$INO.tmp" "$INO"
   [[ "$(vcode)" == "$ver" ]] || die "Version-Bump fehlgeschlagen"
   do_build
   # Nur die Pfade committen, die zum Release gehoeren -- kein pauschales Hinzufuegen des
